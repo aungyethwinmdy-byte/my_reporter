@@ -14,13 +14,13 @@ window['ai_edge_gallery_get_result'] = async (data) => {
             return JSON.stringify({ error: "Failed to generate news content." });
         }
 
-        // Webview သို့ ဒေတာပို့ရန် URL သတ်မှတ်ခြင်း (Encode လုပ်၍ ပို့ပါမည်)
+        // Webview လမ်းကြောင်းကို 'assets/webview.html' ဟု ပြင်ဆင်ထားသည်
         const encodedNews = encodeURIComponent(newsContent);
         
         return JSON.stringify({ 
             result: "Here is your formatted news article.", 
             webview: { 
-                url: `webview.html?content=${encodedNews}`, 
+                url: `assets/webview.html?content=${encodedNews}`, 
                 aspectRatio: 1.0 
             } 
         });
