@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+</head>
+<body>
+<script>
+window['ai_edge_gallery_get_result'] = async (data) => {
+    try {
+        const jsonData = JSON.parse(data);
+        const newsContent = jsonData.formatted_news;
+
+        if (!newsContent) {
+            return JSON.stringify({ error: "Failed to generate news content." });
+        }
+
+        // Webview သို့ ဒေတာပို့ရန် URL သတ်မှတ်ခြင်း (Encode လုပ်၍ ပို့ပါမည်)
+        const encodedNews = encodeURIComponent(newsContent);
+        
+        return JSON.stringify({ 
+            result: "Here is your formatted news article.", 
+            webview: { 
+                url: `webview.html?content=${encodedNews}`, 
+                aspectRatio: 1.0 
+            } 
+        });
+        
+    } catch (e) {
+        return JSON.stringify({ error: `Failed: ${e.message}` });
+    }
+};
+</script>
+</body>
+</html>
