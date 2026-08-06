@@ -17,6 +17,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 def send_telegram_message(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram credentials missing!")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -25,7 +26,8 @@ def send_telegram_message(message):
         "parse_mode": "HTML"
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
+        print(f"Telegram response code: {res.status_code}")
     except Exception as e:
         print(f"Telegram notification failed: {e}")
 
@@ -84,7 +86,7 @@ def process_newspaper(service, page_url, folder_id, prefix):
                 filename = f"{today_str}_{prefix}_{file_id}.pdf"
 
                 if file_exists_in_gdrive(service, folder_id, filename):
-                    print(f"Skipping: {filename} (Already exists)")
+                    print(f"Skipping: {filename} (Already in Drive)")
                     continue
 
                 print(f"Downloading {filename}...")
@@ -112,10 +114,15 @@ if __name__ == "__main__":
     km_uploads = process_newspaper(drive_service, "https://www.moi.gov.mm/km/", KM_FOLDER_ID, "Kyemon")
 
     all_uploads = mal_uploads + km_uploads
+    today_date = datetime.now().strftime("%d-%b-%Y")
 
     if all_uploads:
-        msg = f"<b>📰 ယနေ့ သတင်းစာအသစ်များ Google Drive ထို့ သိမ်းဆည်းပြီးပါပြီ။</b>\n\n"
+        msg = f"<b>📰 ယနေ့ ({today_date}) သတင်းစာအသစ်များ Google Drive သို့ သိမ်းဆည်းပြီးပါပြီ။</b>\n\n"
         for name, link in all_uploads:
             msg += f"• <a href='{link}'>{name}</a>\n"
         send_telegram_message(msg)
-        print("Telegram notification sent successfully!")
+    else:
+        msg = f"<b>📰 သတင်းစာ စနစ် စစ်ဆေးချက် ({today_date})</b>\n\nGoogle Drive ထဲတွင် ယနေ့ သတင်းစာများ အပြည့်အစုံ ရှိနှင့်ပြီး ဖြစ်ပါသည်။"
+        send_telegram_message(msg)
+
+    print("Process completed!")
