@@ -76,8 +76,9 @@ def upload_to_gdrive(service, folder_id, local_file_path, filename):
   return web_link
 
 
-def process_newspaper(service, page_url, folder_id, prefix):
-  print(f"\n--- Checking {prefix} from {page_url} ---")
+# ၁။ MOI ဝက်ဘ်ဆိုက်မှ သတင်းစာ စစ်ဆေးရယူခြင်း
+def process_newspaper_moi(service, page_url, folder_id, prefix):
+  print(f"\n--- Checking MOI ({prefix}) from {page_url} ---")
   headers = {
       "User-Agent": (
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -90,13 +91,14 @@ def process_newspaper(service, page_url, folder_id, prefix):
   try:
     resp = requests.get(page_url, headers=headers, timeout=30)
     if resp.status_code != 200:
-      print(f"Failed to fetch {page_url}, status: {resp.status_code}")
-      return uploaded_files, f"ဝက်ဘ်ဆိုက် ({prefix}) သို့ ဝင်ရောက်၍ မရပါ"
+      print(f"Failed to fetch MOI {page_url}, status: {resp.status_code}")
+      return uploaded_files, f"MOI ({prefix}) ဝင်မရပါ"
 
     soup = BeautifulSoup(resp.text, "html.parser")
     links = soup.find_all("a", href=True)
 
-    today_str = datetime.now(MMT_TZ).strftime("%d-%b-%Y")
+    today = datetime.now(MMT_TZ)
+    today_str = today.strftime("%d-%b-%Y")
 
     for a in links:
       href = a["href"]
@@ -106,7 +108,6 @@ def process_newspaper(service, page_url, folder_id, prefix):
             if href.startswith("http")
             else "https://www.moi.gov.mm" + href
         )
-
         file_id = href.split("/")[-1].split("?")[0]
 
         if file_exists_in_gdrive(service, folder_id, file_id):
@@ -114,7 +115,7 @@ def process_newspaper(service, page_url, folder_id, prefix):
           continue
 
         filename = f"{today_str}_{prefix}_{file_id}.pdf"
-        print(f"Downloading {filename} from {file_url}...")
+        print(f"Downloading {filename} from MOI {file_url}...")
 
         file_resp = requests.get(file_url, headers=headers, timeout=60)
         if file_resp.status_code == 200:
@@ -131,7 +132,72 @@ def process_newspaper(service, page_url, folder_id, prefix):
             os.remove(local_path)
 
   except Exception as e:
-    print(f"Error in {prefix}: {e}")
+    print(f"MOI Error in {prefix}: {e}")
+    return uploaded_files, str(e)
+
+  return uploaded_files, None
+
+
+# ၂။ MOI တွင် မတွေ့ပါက MDN Newspaper Portal မှ အပိုဆောင်း စစ်ဆေးရယူခြင်း (Fallback)
+def process_newspaper_mdn_fallback(service, folder_id, prefix, paper_type):
+  print(f"\n--- Checking MDN Fallback for {prefix} ({paper_type}) ---")
+  headers = {
+      "User-Agent": (
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+          " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      )
+  }
+
+  uploaded_files = []
+  today = datetime.now(MMT_TZ)
+  today_str = today.strftime("%d-%b-%Y")
+
+  # MDN Date format e.g. 7-8-2026
+  mdn_date_str = f"{today.day}-{today.month}-{today.year}"
+  mdn_url = f"https://www.mdn.gov.mm/newspaper/public/?published_date={mdn_date_str}"
+
+  try:
+    resp = requests.get(mdn_url, headers=headers, timeout=30)
+    if resp.status_code != 200:
+      print(f"MDN page failed: {mdn_url}")
+      return uploaded_files, f"MDN Portal ({mdn_date_str}) ဝင်မရပါ"
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    links = soup.find_all("a", href=True)
+
+    file_id_key = f"MDN_{paper_type}_{mdn_date_str}"
+
+    if file_exists_in_gdrive(service, folder_id, file_id_key):
+      print(f"Skipping MDN: {file_id_key} (Already in Drive)")
+      return uploaded_files, None
+
+    for a in links:
+      href = a["href"]
+      if paper_type in href.lower() or ".pdf" in href or "download" in href:
+        file_url = (
+            href if href.startswith("http") else "https://www.mdn.gov.mm" + href
+        )
+
+        filename = f"{today_str}_{prefix}_{file_id_key}.pdf"
+        print(f"Downloading {filename} from MDN {file_url}...")
+
+        file_resp = requests.get(file_url, headers=headers, timeout=60)
+        if file_resp.status_code == 200:
+          local_path = f"/tmp/{filename}"
+          with open(local_path, "wb") as f:
+            f.write(file_resp.content)
+
+          drive_link = upload_to_gdrive(
+              service, folder_id, local_path, filename
+          )
+          uploaded_files.append((filename, drive_link))
+
+          if os.path.exists(local_path):
+            os.remove(local_path)
+          break
+
+  except Exception as e:
+    print(f"MDN Fallback Error in {prefix}: {e}")
     return uploaded_files, str(e)
 
   return uploaded_files, None
@@ -140,15 +206,29 @@ def process_newspaper(service, page_url, folder_id, prefix):
 if __name__ == "__main__":
   drive_service = get_gdrive_service()
 
-  mal_uploads, err_mal = process_newspaper(
+  # ၁။ MOI ဝက်ဘ်ဆိုက်ကို အရင် စစ်ဆေးခြင်း
+  mal_uploads, err_mal = process_newspaper_moi(
       drive_service,
       "https://www.moi.gov.mm/mal/",
       MAL_FOLDER_ID,
       "Myanma_Alinn",
   )
-  km_uploads, err_km = process_newspaper(
+  km_uploads, err_km = process_newspaper_moi(
       drive_service, "https://www.moi.gov.mm/km/", KM_FOLDER_ID, "Kyemon"
   )
+
+  # ၂။ MOI တွင် ဖိုင်သစ် မတွေ့ပါက MDN Portal သို့ အလိုအလျောက် သွားရောက် စစ်ဆေးခြင်း
+  if not mal_uploads:
+    mal_mdn, err_mdn_mal = process_newspaper_mdn_fallback(
+        drive_service, MAL_FOLDER_ID, "Myanma_Alinn", "mal"
+    )
+    mal_uploads.extend(mal_mdn)
+
+  if not km_uploads:
+    km_mdn, err_mdn_km = process_newspaper_mdn_fallback(
+        drive_service, KM_FOLDER_ID, "Kyemon", "km"
+    )
+    km_uploads.extend(km_mdn)
 
   all_uploads = mal_uploads + km_uploads
   today_date = datetime.now(MMT_TZ).strftime("%d-%b-%Y")
