@@ -1,3 +1,4 @@
+import html
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -32,14 +33,15 @@ def send_telegram_message(message):
   }
   try:
     res = requests.post(url, json=payload, timeout=10)
-    print(f"Telegram response code: {res.status_code}")
+    print(f"Telegram status: {res.status_code}, response: {res.text}")
   except Exception as e:
     print(f"Telegram notification failed: {e}")
 
 
 def get_gdrive_service():
   service_account_info = json.loads(os.environ["GDRIVE_SERVICE_ACCOUNT_KEY"])
-  scopes = ["https://www.googleapis.com/auth/drive.file"]
+  # Full drive scope သို့ ပြောင်းလဲထားပါသည်
+  scopes = ["https://www.googleapis.com/auth/drive"]
   creds = Credentials.from_service_account_info(
       service_account_info, scopes=scopes
   )
@@ -47,13 +49,17 @@ def get_gdrive_service():
 
 
 def file_exists_in_gdrive(service, folder_id, file_id_str):
-  query = (
-      f"'{folder_id}' in parents and name contains '{file_id_str}' and trashed ="
-      " false"
-  )
-  results = service.files().list(q=query, fields="files(id, name)").execute()
-  files = results.get("files", [])
-  return len(files) > 0
+  try:
+    query = (
+        f"'{folder_id}' in parents and name contains '{file_id_str}' and trashed"
+        " = false"
+    )
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    files = results.get("files", [])
+    return len(files) > 0
+  except Exception as e:
+    print(f"Drive list files error: {e}")
+    return False
 
 
 def upload_to_gdrive(service, folder_id, local_file_path, filename):
@@ -76,7 +82,6 @@ def upload_to_gdrive(service, folder_id, local_file_path, filename):
   return web_link
 
 
-# ၁။ MOI ဝက်ဘ်ဆိုက်မှ သတင်းစာ စစ်ဆေးရယူခြင်း
 def process_newspaper_moi(service, page_url, folder_id, prefix):
   print(f"\n--- Checking MOI ({prefix}) from {page_url} ---")
   headers = {
@@ -92,7 +97,7 @@ def process_newspaper_moi(service, page_url, folder_id, prefix):
     resp = requests.get(page_url, headers=headers, timeout=30)
     if resp.status_code != 200:
       print(f"Failed to fetch MOI {page_url}, status: {resp.status_code}")
-      return uploaded_files, f"MOI ({prefix}) ဝင်မရပါ"
+      return uploaded_files, f"MOI ({prefix}) ဝင်မရပါ (Status {resp.status_code})"
 
     soup = BeautifulSoup(resp.text, "html.parser")
     links = soup.find_all("a", href=True)
@@ -138,7 +143,6 @@ def process_newspaper_moi(service, page_url, folder_id, prefix):
   return uploaded_files, None
 
 
-# ၂။ MOI တွင် မတွေ့ပါက MDN Newspaper Portal မှ အပိုဆောင်း စစ်ဆေးရယူခြင်း (Fallback)
 def process_newspaper_mdn_fallback(service, folder_id, prefix, paper_type):
   print(f"\n--- Checking MDN Fallback for {prefix} ({paper_type}) ---")
   headers = {
@@ -152,7 +156,6 @@ def process_newspaper_mdn_fallback(service, folder_id, prefix, paper_type):
   today = datetime.now(MMT_TZ)
   today_str = today.strftime("%d-%b-%Y")
 
-  # MDN Date format e.g. 7-8-2026
   mdn_date_str = f"{today.day}-{today.month}-{today.year}"
   mdn_url = f"https://www.mdn.gov.mm/newspaper/public/?published_date={mdn_date_str}"
 
@@ -160,7 +163,10 @@ def process_newspaper_mdn_fallback(service, folder_id, prefix, paper_type):
     resp = requests.get(mdn_url, headers=headers, timeout=30)
     if resp.status_code != 200:
       print(f"MDN page failed: {mdn_url}")
-      return uploaded_files, f"MDN Portal ({mdn_date_str}) ဝင်မရပါ"
+      return (
+          uploaded_files,
+          f"MDN Portal ({mdn_date_str}) ဝင်မရပါ (Status {resp.status_code})",
+      )
 
     soup = BeautifulSoup(resp.text, "html.parser")
     links = soup.find_all("a", href=True)
@@ -206,7 +212,6 @@ def process_newspaper_mdn_fallback(service, folder_id, prefix, paper_type):
 if __name__ == "__main__":
   drive_service = get_gdrive_service()
 
-  # ၁။ MOI ဝက်ဘ်ဆိုက်ကို အရင် စစ်ဆေးခြင်း
   mal_uploads, err_mal = process_newspaper_moi(
       drive_service,
       "https://www.moi.gov.mm/mal/",
@@ -217,7 +222,6 @@ if __name__ == "__main__":
       drive_service, "https://www.moi.gov.mm/km/", KM_FOLDER_ID, "Kyemon"
   )
 
-  # ၂။ MOI တွင် ဖိုင်သစ် မတွေ့ပါက MDN Portal သို့ အလိုအလျောက် သွားရောက် စစ်ဆေးခြင်း
   if not mal_uploads:
     mal_mdn, err_mdn_mal = process_newspaper_mdn_fallback(
         drive_service, MAL_FOLDER_ID, "Myanma_Alinn", "mal"
@@ -233,7 +237,6 @@ if __name__ == "__main__":
   all_uploads = mal_uploads + km_uploads
   today_date = datetime.now(MMT_TZ).strftime("%d-%b-%Y")
 
-  # Google Drive ဖိုဒါ လင့်ခ်များ
   mal_drive_url = f"https://drive.google.com/drive/folders/{MAL_FOLDER_ID}"
   km_drive_url = f"https://drive.google.com/drive/folders/{KM_FOLDER_ID}"
 
@@ -243,7 +246,7 @@ if __name__ == "__main__":
         " သိမ်းဆည်းပြီးပါပြီ။</b>\n\n"
     )
     for name, link in all_uploads:
-      msg += f"• <a href='{link}'>{name}</a>\n"
+      msg += f"• <a href='{link}'>{html.escape(name)}</a>\n"
 
     msg += "\n<b>📁 Google Drive ဖိုဒါများ -</b>\n"
     msg += f"• <a href='{mal_drive_url}'>မြန်မာ့အလင်း ဖိုဒါ ကြည့်ရန်</a>\n"
@@ -256,9 +259,9 @@ if __name__ == "__main__":
         " ရယူစဉ် အမှားတက်ခဲ့ပါသည်:\n"
     )
     if err_mal:
-      msg += f"• မြန်မာ့အလင်း: {err_mal}\n"
+      msg += f"• မြန်မာ့အလင်း: {html.escape(str(err_mal))}\n"
     if err_km:
-      msg += f"• ကြေးမုံ: {err_km}\n"
+      msg += f"• ကြေးမုံ: {html.escape(str(err_km))}\n"
 
     msg += "\n<b>📁 Google Drive ဖိုဒါများ -</b>\n"
     msg += f"• <a href='{mal_drive_url}'>မြန်မာ့အလင်း ဖိုဒါ ကြည့်ရန်</a>\n"
