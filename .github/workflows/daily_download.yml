@@ -2,7 +2,8 @@ name: Daily Newspaper Downloader
 
 on:
   schedule:
-    - cron: '0 1 * * *'
+    # နေ့စဉ် မြန်မာစံတော်ချိန် မနက် ၉:၀၀ နာရီ (02:30 AM UTC) တွင် အလိုအလျောက် မောင်းနှင်ရန်
+    - cron: '30 2 * * *'
   workflow_dispatch:
 
 jobs:
@@ -25,6 +26,7 @@ jobs:
 
       - name: Run Downloader Script
         env:
+          TZ: 'Asia/Yangon'
           GDRIVE_SERVICE_ACCOUNT_KEY: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
