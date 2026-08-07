@@ -3,7 +3,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
-from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import requests
@@ -33,17 +33,20 @@ def send_telegram_message(message):
   }
   try:
     res = requests.post(url, json=payload, timeout=10)
-    print(f"Telegram status: {res.status_code}, response: {res.text}")
+    print(f"Telegram status code: {res.status_code}")
   except Exception as e:
     print(f"Telegram notification failed: {e}")
 
 
 def get_gdrive_service():
-  service_account_info = json.loads(os.environ["GDRIVE_SERVICE_ACCOUNT_KEY"])
-  # Full drive scope သို့ ပြောင်းလဲထားပါသည်
-  scopes = ["https://www.googleapis.com/auth/drive"]
-  creds = Credentials.from_service_account_info(
-      service_account_info, scopes=scopes
+  # OAuth2 User Credentials ဖြင့် ချိတ်ဆက်ခြင်း
+  creds = Credentials(
+      token=None,
+      refresh_token=os.environ["GDRIVE_REFRESH_TOKEN"],
+      token_uri="https://oauth2.googleapis.com/token",
+      client_id=os.environ["GDRIVE_CLIENT_ID"],
+      client_secret=os.environ["GDRIVE_CLIENT_SECRET"],
+      scopes=["https://www.googleapis.com/auth/drive.file"],
   )
   return build("drive", "v3", credentials=creds)
 
@@ -58,7 +61,7 @@ def file_exists_in_gdrive(service, folder_id, file_id_str):
     files = results.get("files", [])
     return len(files) > 0
   except Exception as e:
-    print(f"Drive list files error: {e}")
+    print(f"Error checking file in Drive: {e}")
     return False
 
 
@@ -69,9 +72,7 @@ def upload_to_gdrive(service, folder_id, local_file_path, filename):
   )
   file = (
       service.files()
-      .create(
-          body=file_metadata, media_body=media, fields="id, webViewLink"
-      )
+      .create(body=file_metadata, media_body=media, fields="id, webViewLink")
       .execute()
   )
   file_id = file.get("id")
