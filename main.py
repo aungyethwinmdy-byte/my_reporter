@@ -1,7 +1,7 @@
+from datetime import datetime, timedelta, timezone
 import html
 import json
 import os
-from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -106,36 +106,45 @@ def process_newspaper_moi(service, page_url, folder_id, prefix):
     today = datetime.now(MMT_TZ)
     today_str = today.strftime("%d-%b-%Y")
 
+    # PDF Link များကို သီးသန့်ထုတ်ယူခြင်း
+    pdf_links = []
     for a in links:
       href = a["href"]
       if "/file-download/download/public/" in href or ".pdf" in href:
-        file_url = (
-            href
-            if href.startswith("http")
-            else "https://www.moi.gov.mm" + href
-        )
-        file_id = href.split("/")[-1].split("?")[0]
+        pdf_links.append(href)
 
-        if file_exists_in_gdrive(service, folder_id, file_id):
-          print(f"Skipping: {file_id} (Already in Drive)")
-          continue
+    if not pdf_links:
+      print(f"No PDF links found on MOI ({prefix})")
+      return uploaded_files, None
 
-        filename = f"{today_str}_{prefix}_{file_id}.pdf"
-        print(f"Downloading {filename} from MOI {file_url}...")
+    # MOI စာမျက်နှာ၏ ထိပ်ဆုံးမှ အသစ်ဆုံး စာစောင် Link (ပထမဆုံး Link) တစ်ခုတည်းကိုသာ ယူမည်
+    latest_href = pdf_links[0]
+    file_url = (
+        latest_href
+        if latest_href.startswith("http")
+        else "https://www.moi.gov.mm" + latest_href
+    )
+    file_id = latest_href.split("/")[-1].split("?")[0]
 
-        file_resp = requests.get(file_url, headers=headers, timeout=60)
-        if file_resp.status_code == 200:
-          local_path = f"/tmp/{filename}"
-          with open(local_path, "wb") as f:
-            f.write(file_resp.content)
+    # အကယ်၍ ထိပ်ဆုံးမှ အသစ်ဆုံး စာစောင်သည် Drive ထဲတွင် ရှိပြီးသားဆိုပါက ဆက်မလုပ်တော့ဘဲ ရပ်မည်
+    if file_exists_in_gdrive(service, folder_id, file_id):
+      print(f"Skipping: {file_id} (Latest issue already in Drive)")
+      return uploaded_files, None
 
-          drive_link = upload_to_gdrive(
-              service, folder_id, local_path, filename
-          )
-          uploaded_files.append((filename, drive_link))
+    filename = f"{today_str}_{prefix}_{file_id}.pdf"
+    print(f"Downloading latest {filename} from MOI {file_url}...")
 
-          if os.path.exists(local_path):
-            os.remove(local_path)
+    file_resp = requests.get(file_url, headers=headers, timeout=60)
+    if file_resp.status_code == 200:
+      local_path = f"/tmp/{filename}"
+      with open(local_path, "wb") as f:
+        f.write(file_resp.content)
+
+      drive_link = upload_to_gdrive(service, folder_id, local_path, filename)
+      uploaded_files.append((filename, drive_link))
+
+      if os.path.exists(local_path):
+        os.remove(local_path)
 
   except Exception as e:
     print(f"MOI Error in {prefix}: {e}")
@@ -158,7 +167,9 @@ def process_newspaper_mdn_fallback(service, folder_id, prefix, paper_type):
   today_str = today.strftime("%d-%b-%Y")
 
   mdn_date_str = f"{today.day}-{today.month}-{today.year}"
-  mdn_url = f"https://www.mdn.gov.mm/newspaper/public/?published_date={mdn_date_str}"
+  mdn_url = (
+      f"https://www.mdn.gov.mm/newspaper/public/?published_date={mdn_date_str}"
+  )
 
   try:
     resp = requests.get(mdn_url, headers=headers, timeout=30)
