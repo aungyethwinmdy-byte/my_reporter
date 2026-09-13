@@ -1,0 +1,37 @@
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Environment Variables & Secrets (လုံခြုံရေးအတွက် မဖြစ်မနေ လိုအပ်သည်)
+.env
+*.env
+
+# Local Databases & Manifests
+download_history.sqlite3
+*.sqlite3
+*.db
+download_manifest.json
+
+# Temporary Downloaded PDF Files (သတင်းစာ PDF များ Git ထဲ မရောက်စေရန်)
+*.pdf
+/tmp/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# IDE & Editor Settings
+.vscode/
+.idea/
+*.swp
+
+# Logs & System Files
+*.log
+.DS_Store
+Thumbs.db
+.env
+__pycache__/
+*.pyc

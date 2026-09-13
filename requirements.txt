@@ -1,0 +1,11 @@
+beautifulsoup4
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
+google-generativeai>=0.8.0
+pytz
+requests
+supabase>=2.0.0
+urllib3
+pyTelegramBotAPI>=4.20.0

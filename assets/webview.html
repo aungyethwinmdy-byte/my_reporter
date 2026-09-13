@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="my">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>News Editor</title>
+    <style>
+        body {
+            font-family: 'Pyidaungsu', sans-serif;
+            background-color: #f4f6f8;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+        .header {
+            font-size: 18px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        #editor {
+            flex-grow: 1;
+            width: 100%;
+            padding: 15px;
+            font-size: 16px;
+            line-height: 1.6;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            background-color: #fff;
+            resize: none;
+            box-sizing: border-box;
+            outline: none;
+        }
+        #editor:focus {
+            border-color: #0066cc;
+            box-shadow: 0 0 5px rgba(0,102,204,0.3);
+        }
+        .btn-container {
+            margin-top: 15px;
+            display: flex;
+            justify-content: flex-end;
+        }
+        .btn {
+            background-color: #0066cc;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 16px;
+            font-weight: bold;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        .btn:hover {
+            background-color: #004c99;
+        }
+        .btn:active {
+            transform: scale(0.98);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <span>State Policy Editor</span>
+    </div>
+
+    <textarea id="editor" spellcheck="false">Loading news...</textarea>
+
+    <div class="btn-container">
+        <button class="btn" onclick="copyText()" id="copyBtn">Copy to Clipboard</button>
+    </div>
+
+    <script>
+        // URL မှ content ကို ယူ၍ Editor ထဲသို့ ထည့်ခြင်း
+        document.addEventListener('DOMContentLoaded', () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const content = urlParams.get('content');
+            
+            if (content) {
+                document.getElementById('editor').value = decodeURIComponent(content);
+            } else {
+                document.getElementById('editor').value = "No content generated. Please try again.";
+            }
+        });
+
+        // Copy ခလုတ်နှိပ်ပါက အလုပ်လုပ်မည့် Function
+        function copyText() {
+            const editor = document.getElementById('editor');
+            editor.select();
+            editor.setSelectionRange(0, 99999); // Mobile အတွက်
+
+            navigator.clipboard.writeText(editor.value).then(() => {
+                const btn = document.getElementById('copyBtn');
+                btn.innerText = "Copied!";
+                btn.style.backgroundColor = "#28a745"; // အစိမ်းရောင်ပြောင်းရန်
+                
+                setTimeout(() => {
+                    btn.innerText = "Copy to Clipboard";
+                    btn.style.backgroundColor = "#0066cc";
+                }, 2000);
+            }).catch(err => {
+                alert("Failed to copy text. Please copy manually.");
+            });
+        }
+    </script>
+</body>
+</html>

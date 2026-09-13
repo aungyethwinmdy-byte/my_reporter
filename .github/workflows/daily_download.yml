@@ -1,0 +1,90 @@
+name: Daily Newspaper Downloader & Ingestion Engine
+
+on:
+  schedule:
+    # မြန်မာစံတော်ချိန် မနက် ၆:၃၀ မှ မွန်းလွဲ ၂:၃၀ အထိ ၁ နာရီတစ်ကြိမ် Auto Run မည်
+    # UTC 00:00 - 08:00 == MMT 06:30 - 14:30
+    - cron: '0 0-8 * * *'
+  workflow_dispatch:
+    inputs:
+      newspaper:
+        description: "Newspaper to download"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - both
+          - myanma_alinn
+          - kyemon
+      download_date:
+        description: "Optional date in YYYY-MM-DD format"
+        required: false
+        type: string
+
+# တစ်ချိန်တည်း Job နှစ်ခု ထပ်တူ Run မိခြင်း မဖြစ်စေရန်
+concurrency:
+  group: daily-newspaper-download
+  cancel-in-progress: false
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run automated tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Run Downloader & Ingestion Script
+        env:
+          TZ: 'Asia/Yangon'
+          NEWSPAPER: ${{ inputs.newspaper || 'both' }}
+          DOWNLOAD_DATE: ${{ inputs.download_date || '' }}
+          DATABASE_PATH: download_history.sqlite3
+          MANIFEST_PATH: download_manifest.json
+          MAL_FOLDER_ID: ${{ secrets.MAL_FOLDER_ID }}
+          KM_FOLDER_ID: ${{ secrets.KM_FOLDER_ID }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL || 'gemini-2.5-flash' }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python main.py
+
+      - name: Upload download history artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: download-history-${{ github.run_id }}
+          path: |
+            download_history.sqlite3
+            download_manifest.json
+          if-no-files-found: ignore
+
+      - name: Write workflow summary
+        if: always()
+        run: |
+          echo "## Daily Newspaper Downloader & Ingestion Engine" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Status: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Scheduled timezone: Asia/Yangon" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Schedule frequency: Hourly (6:30 AM - 2:30 PM MMT)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Gemini Model: ${{ secrets.GEMINI_MODEL || 'gemini-2.5-flash' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Run time (UTC): $(date -u)" >> "$GITHUB_STEP_SUMMARY"
