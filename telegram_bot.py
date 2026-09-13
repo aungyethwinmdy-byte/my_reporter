@@ -2,10 +2,41 @@ import os
 import re
 import json
 import logging
+import asyncio
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from supabase import create_client, Client
 from google import genai
 from google.genai import types
 
+# .env ဖိုင်မှ အချက်အလက်များ လုတ်ယူခြင်း
+load_dotenv()
+
+# Logging သတ်မှတ်ခြင်း
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
+
+# Credentials ရယူခြင်း
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8521816249:AAGYUsPI7mg1iWoboEo1_fBKJZ1e9rWdymM")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://zdsxuxwonkovuesjepfa.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""))
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+# Supabase Client ဖန်တီးခြင်း
+supabase_client: Client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Gemini Client ဖန်တီးခြင်း (Official google-genai SDK)
+genai_client = None
+if GEMINI_API_KEY:
+    genai_client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    genai_client = genai.Client()
 
 # ၁။ မြန်မာ စကားပြော Filler များကို အရှည်ဆုံးမှ အတိုသို့ သတ်မှတ်ခြင်း
 BURMESE_FILLERS = sorted([
@@ -63,7 +94,6 @@ Example: ["ကမ္ဘောဒီးယား", "ခရီးစဉ်"]"""
     except Exception as e:
         logger.error(f"Dynamic query parser error: {e}")
 
-    # Fallback: စကားလုံး ၂ လုံးထက်ပိုသော အဓိက အပိုင်းအစများကို ယူခြင်း
     tokens = [t for t in re.split(r'[\s၊။]+', cleaned_hint) if len(t) > 1]
     return tokens[:3] if tokens else [user_query[:20]]
 
@@ -72,13 +102,12 @@ def search_articles_view_safely(supabase_client, search_keywords: list[str]):
     Supabase 'articles' View ထဲမှ သတင်းများ Dynamic ရှာဖွေခြင်း
     (Strict Allowed Columns Only: article_id, newspaper_name, issue_date, page_no, headline, body_text)
     """
-    if not search_keywords:
+    if not supabase_client or not search_keywords:
         return []
 
     fetched_articles = []
     seen_ids = set()
 
-    # Performance ကောင်းစေရန် ထိပ်ဆုံး keyword ၃ ခုဖြင့်သာ အဓိက ရှာဖွေခြင်း
     for kw in search_keywords[:3]:
         clean_kw = re.sub(r'[,;\'"()%]', '', kw).strip()
         if not clean_kw or len(clean_kw) < 2:
@@ -99,7 +128,6 @@ def search_articles_view_safely(supabase_client, search_keywords: list[str]):
         except Exception as e:
             logger.error(f"Error querying 'articles' view for keyword '{clean_kw}': {e}")
 
-    # AI Context ထဲ ထည့်ရန် အသင့်တော်ဆုံး Top 8 ပုဒ်ကိုသာ ပြန်ပေးခြင်း
     return fetched_articles[:8]
 
 def generate_newsroom_ai_response(genai_client, user_query: str, retrieved_articles: list) -> str:
@@ -141,3 +169,48 @@ Your Task:
     except Exception as e:
         logger.error(f"Response generation error: {e}")
         return "⚠️ **အဖြေ ထုတ်ပြန်ရာတွင် အမှားအယွင်း ဖြစ်ပေါ်ခဲ့ပါသည်။**"
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_msg = (
+        "🏛️ **Myanmar Intelligent Newsroom AI Chatbot** သို့ ကြိုဆိုပါသည်။\n\n"
+        "မြန်မာ့အလင်း နှင့် ကြေးမုံ သတင်းစာများမှ သတင်းအချက်အလက်များကို AI စနစ်ဖြင့် ရှာဖွေ မေးမြန်းနိုင်ပါသည်။"
+    )
+    await update.message.reply_text(welcome_msg)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_query = update.message.text
+    if not user_query:
+        return
+
+    logger.info(f"Received query from Telegram: '{user_query}'")
+    status_msg = await update.message.reply_text("🔍 သတင်းဒေတာဘေ့စ်တွင် ရှာဖွေဆန်းစစ်နေပါသည်...")
+
+    try:
+        keywords = dynamic_ai_query_parser(genai_client, user_query)
+        logger.info(f"Extracted keywords: {keywords}")
+
+        articles = search_articles_view_safely(supabase_client, keywords)
+        logger.info(f"Fetched {len(articles)} articles from database.")
+
+        answer = generate_newsroom_ai_response(genai_client, user_query, articles)
+        await status_msg.edit_text(answer)
+    except Exception as e:
+        logger.error(f"Error handling user message: {e}")
+        await status_msg.edit_text("⚠️ **မေးမြန်းမှုအား ဆန်းစစ်ရာတွင် အမှားအယွင်း ဖြစ်ပေါ်ခဲ့ပါသည်။**")
+
+def main():
+    if not TELEGRAM_BOT_TOKEN:
+        print("❌ Error: TELEGRAM_BOT_TOKEN is missing!")
+        return
+
+    print("🤖 Myanmar Intelligent Newsroom AI Bot is starting...")
+    print("Press Ctrl+C to stop.")
+
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
