@@ -1,7 +1,10 @@
 import os
 import re
+import time
+import threading
 import requests
 import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import pytz
@@ -36,6 +39,42 @@ MOI_SOURCES = [
         "base_url": "https://www.moi.gov.mm",
     },
 ]
+
+# ------------------------------------------------------------
+# Scraper performance guards
+# ------------------------------------------------------------
+# MOI slug probing used to run strictly sequentially: ~9 candidate URLs x 4s
+# timeout, then a category page plus one request per matching detail link —
+# twice, once per newspaper. On a slow day that alone could eat the workflow's
+# 15-minute job budget. Probe in parallel and cap each phase with a deadline.
+MOI_SLUG_TIMEOUT = float(os.environ.get("MOI_SLUG_TIMEOUT", "8"))
+MOI_MAX_WORKERS = int(os.environ.get("MOI_MAX_WORKERS", "8"))
+MOI_PHASE_BUDGET = float(os.environ.get("MOI_PHASE_BUDGET", "90"))
+MDN_DATE_TIMEOUT = float(os.environ.get("MDN_DATE_TIMEOUT", "10"))
+
+_thread_local = threading.local()
+
+
+def _http_session():
+    """Thread-local Session so parallel probes reuse TCP connections."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        _thread_local.session = session
+    return session
+
+
+def _fetch_html(url, timeout, params=None):
+    """Single GET that returns HTML text or None. Never raises."""
+    try:
+        response = _http_session().get(url, params=params, timeout=timeout, verify=False)
+        if response.status_code == 200:
+            return response.text
+    except Exception:
+        return None
+    return None
+
 
 MONTH_MAP = {
     "01": ["jan", "january", "ဇန်နဝါရီ"],
@@ -152,8 +191,45 @@ def parse_universal_date(raw_text: str):
 # ၃။ Online Paper Scraping & Download Functions (အသစ်)
 # ==========================================
 
+def _probe_for_pdf_links(urls, base_url, timeout, deadline):
+    """
+    urls များကို parallel စမ်းပြီး PDF link ပါသော ပထမဆုံး URL ကို ပြန်ပေးသည်။
+
+    deadline (time.monotonic) ကျော်လျှင် ရှာဖွေမှု ရပ်ပြီး None ပြန်ပေးသည်။
+    """
+    urls = list(dict.fromkeys(urls))
+    if not urls or deadline <= time.monotonic():
+        return None
+
+    found = None
+    with ThreadPoolExecutor(max_workers=min(MOI_MAX_WORKERS, len(urls))) as executor:
+        futures = {executor.submit(_fetch_html, url, timeout): url for url in urls}
+        try:
+            for future in as_completed(futures, timeout=max(1.0, deadline - time.monotonic())):
+                if deadline <= time.monotonic():
+                    break
+                html = future.result()
+                if not html:
+                    continue
+                links = extract_pdf_links(html)
+                if links:
+                    found = absolute_url(links[0], base_url)
+                    break
+        except Exception:
+            # Budget exhausted (as_completed timeout) — return whatever we have.
+            return found
+        for future in futures:
+            future.cancel()
+    return found
+
+
 def find_moi_paper_universal(prefix, base_url, day, month, year):
-    """MOI Website မှ သတ်မှတ်ရက်စွဲအတွက် PDF Link ရှာဖွေခြင်း"""
+    """
+    MOI Website မှ သတ်မှတ်ရက်စွဲအတွက် PDF Link ရှာဖွေခြင်း။
+
+    Sequential probing အစား parallel probing + MOI_PHASE_BUDGET (default 90s)
+    ဖြင့် အချိန်ကန့်သတ်ထားသည်။
+    """
     int_day = str(int(day))
     pad_day = f"{int(day):02d}"
     short_year = year[-2:]
@@ -171,34 +247,36 @@ def find_moi_paper_universal(prefix, base_url, day, month, year):
         ])
     slugs = list(dict.fromkeys(slugs))
 
-    # ၁။ Direct URL Slugs ဖြင့် ရှာဖွေခြင်း
-    for slug in slugs:
-        article_url = f"{base_url.rstrip('/')}/{prefix}/{slug}"
-        try:
-            r = requests.get(article_url, headers=HEADERS, timeout=4, verify=False)
-            if r.status_code == 200:
-                links = extract_pdf_links(r.text)
-                if links:
-                    return absolute_url(links[0], base_url)
-        except Exception:
-            continue
+    base = base_url.rstrip("/")
+    deadline = time.monotonic() + MOI_PHASE_BUDGET
+
+    # ၁။ Direct URL Slugs ဖြင့် ရှာဖွေခြင်း (parallel)
+    result = _probe_for_pdf_links(
+        [f"{base}/{prefix}/{slug}" for slug in slugs],
+        base_url,
+        MOI_SLUG_TIMEOUT,
+        deadline,
+    )
+    if result:
+        return result
 
     # ၂။ Homepage Category စာမျက်နှာမှ ရှာဖွေခြင်း
-    try:
-        r = requests.get(f"{base_url.rstrip('/')}/{prefix}/", headers=HEADERS, timeout=5, verify=False)
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "html.parser")
+    if deadline > time.monotonic():
+        category_html = _fetch_html(
+            f"{base}/{prefix}/", max(1.0, min(MOI_SLUG_TIMEOUT, deadline - time.monotonic()))
+        )
+        if category_html:
+            soup = BeautifulSoup(category_html, "html.parser")
+            detail_urls = []
             for a in soup.find_all("a", href=True):
                 href = a["href"]
                 if any(s in href for s in slugs):
-                    detail_url = absolute_url(href, base_url)
-                    dr = requests.get(detail_url, headers=HEADERS, timeout=4, verify=False)
-                    if dr.status_code == 200:
-                        links = extract_pdf_links(dr.text)
-                        if links:
-                            return absolute_url(links[0], base_url)
-    except Exception:
-        pass
+                    detail_urls.append(absolute_url(href, base_url))
+            result = _probe_for_pdf_links(
+                detail_urls, base_url, MOI_SLUG_TIMEOUT, deadline
+            )
+            if result:
+                return result
 
     return None
 
@@ -211,30 +289,42 @@ def get_mdn_backup_papers(day, month, year):
         f"{year}-{month}-{day}",
         f"{day}-{month}-{year}",
     ]
-    for fmt in date_formats:
+    date_formats = list(dict.fromkeys(date_formats))
+
+    def _probe(fmt):
+        html = _fetch_html(
+            "https://www.mdn.gov.mm/newspaper/public/",
+            MDN_DATE_TIMEOUT,
+            params={"published_date": fmt},
+        )
+        if not html:
+            return None
+        ids = list(dict.fromkeys(re.findall(r"ebooks/(?:download|read)/(\d+)", html)))
+        return ids or None
+
+    names = ["မြန်မာ့အလင်း", "ကြေးမုံ", "The Global New Light of Myanmar"]
+    prefixes = ["myanmaalinn", "themirror", "newlightmyanmar"]
+
+    with ThreadPoolExecutor(max_workers=min(4, len(date_formats))) as executor:
+        futures = {executor.submit(_probe, fmt): fmt for fmt in date_formats}
         try:
-            r = requests.get(
-                "https://www.mdn.gov.mm/newspaper/public/",
-                params={"published_date": fmt},
-                headers=HEADERS,
-                timeout=5,
-                verify=False,
-            )
-            if r.status_code == 200:
-                ids = list(dict.fromkeys(re.findall(r"ebooks/(?:download|read)/(\d+)", r.text)))
-                if ids:
-                    names = ["မြန်မာ့အလင်း", "ကြေးမုံ", "The Global New Light of Myanmar"]
-                    prefixes = ["myanmaalinn", "themirror", "newlightmyanmar"]
-                    return [
-                        {
-                            "name": names[i] if i < len(names) else f"သတင်းစာ-{i+1}",
-                            "file_prefix": prefixes[i] if i < len(prefixes) else f"paper_{i+1}",
-                            "url": f"https://www.mdn.gov.mm/newspaper/public/ebooks/download/{pid}",
-                        }
-                        for i, pid in enumerate(ids)
-                    ]
+            for future in as_completed(futures, timeout=MDN_DATE_TIMEOUT + 5):
+                ids = future.result()
+                if not ids:
+                    continue
+                return [
+                    {
+                        "name": names[i] if i < len(names) else f"သတင်းစာ-{i+1}",
+                        "file_prefix": prefixes[i] if i < len(prefixes) else f"paper_{i+1}",
+                        "url": f"https://www.mdn.gov.mm/newspaper/public/ebooks/download/{pid}",
+                    }
+                    for i, pid in enumerate(ids)
+                ]
         except Exception:
-            continue
+            return []
+        finally:
+            for future in futures:
+                future.cancel()
     return []
 
 
