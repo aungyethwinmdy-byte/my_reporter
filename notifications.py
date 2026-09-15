@@ -1,12 +1,19 @@
 import html
 
 
+def _is_url(value):
+    """Telegram က URL မဟုတ်သော button link ကို ငြင်းပယ်ပြီး sendMessage 400 ပြန်ပါသည်။"""
+    return isinstance(value, str) and value.startswith(("http://", "https://"))
+
+
 def _button_rows(uploads, drive_urls):
     rows = []
     for filename, link in uploads:
-        rows.append([{"text": f"ဖိုင်ဖွင့်ရန် · {filename}", "url": link}])
+        if _is_url(link):
+            rows.append([{"text": f"ဖိုင်ဖွင့်ရန် · {filename}", "url": link}])
     for label, link in drive_urls.items():
-        rows.append([{"text": f"ဖိုဒါဖွင့်ရန် · {label}", "url": link}])
+        if _is_url(link):
+            rows.append([{"text": f"ဖိုဒါဖွင့်ရန် · {label}", "url": link}])
     return {"inline_keyboard": rows} if rows else None
 
 

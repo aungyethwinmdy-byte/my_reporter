@@ -64,10 +64,20 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL || 'gemini-2.5-flash' }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: python main.py
+
+      - name: Ingest independent media (BBC / Irrawaddy / RFA)
+        # External feeds can be rate-limited or blocked; never fail the whole run.
+        continue-on-error: true
+        env:
+          TZ: 'Asia/Yangon'
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          INDEPENDENT_TABLE_NAME: ${{ vars.INDEPENDENT_TABLE_NAME || 'independent_articles' }}
+        run: python fetch_independent_news.py
 
       - name: Upload download history artifacts
         if: always()
@@ -86,5 +96,5 @@ jobs:
           echo "- Status: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scheduled timezone: Asia/Yangon" >> "$GITHUB_STEP_SUMMARY"
           echo "- Schedule frequency: Hourly (6:30 AM - 2:30 PM MMT)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Gemini Model: ${{ secrets.GEMINI_MODEL || 'gemini-2.5-flash' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Gemini Model: ${{ secrets.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Run time (UTC): $(date -u)" >> "$GITHUB_STEP_SUMMARY"

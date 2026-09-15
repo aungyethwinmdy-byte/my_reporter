@@ -241,7 +241,10 @@ def process_newspaper(service, folder_id, name, prefix, file_prefix, base_url, d
         else:
             logger.warning("Supabase direct ingestion skipped or failed for %s", filename)
 
-        return [(filename, drive_link or "Direct DB Ingested")], None
+        # NOTE: Telegram inline buttons require a real http(s) URL. Passing the
+        # literal "Direct DB Ingested" made sendMessage fail with HTTP 400,
+        # so the whole notification was silently lost.
+        return [(filename, drive_link)], None
     finally:
         if os.path.exists(local_path):
             try: os.remove(local_path)
