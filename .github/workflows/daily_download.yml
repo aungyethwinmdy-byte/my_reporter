@@ -1,6 +1,9 @@
 name: Daily Newspaper Downloader & Ingestion Engine
 
 on:
+  # TEMP: push trigger to verify this branch on CI (removed before merge)
+  push:
+    branches: [arena/01a0a37b-my-reporter]
   schedule:
     # မြန်မာစံတော်ချိန် မနက် ၆:၃၀ မှ မွန်းလွဲ ၂:၃၀ အထိ ၁ နာရီတစ်ကြိမ် Auto Run မည်
     # UTC 00:00 - 08:00 == MMT 06:30 - 14:30
