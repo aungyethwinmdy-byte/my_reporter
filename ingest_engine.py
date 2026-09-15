@@ -48,13 +48,24 @@ if GEMINI_API_KEY and genai:
     except Exception as e:
         print(f"⚠️ Gemini Init Error: {e}")
 
-# GEMINI_MODEL honours the same env var the GitHub Actions workflow exports.
-# Previously it was exported but never read, so the workflow default had no
-# effect at all.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
-GEMINI_FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-flash-latest"]
+# Model selection lives in gemini_config so every module (this ingest engine,
+# the Telegram bot, the verifier, the numeric extractor) reads the same
+# GEMINI_MODEL / GEMINI_FALLBACK_MODELS values and uses the same fallback chain.
+from gemini_config import (
+    GEMINI_FALLBACK_MODELS,
+    GEMINI_MODEL,
+    GEMINI_MODELS,
+    generate_content_with_fallback,
+)
 
-GEMINI_MODELS = list(dict.fromkeys([GEMINI_MODEL] + GEMINI_FALLBACK_MODELS))
+
+def _parse_article_list(text):
+    """Strip an optional ```json fence and require a JSON array."""
+    cleaned = re.sub(r'^```json\s*|\s*```$', '', text.strip(), flags=re.MULTILINE)
+    articles = json.loads(cleaned)
+    if not isinstance(articles, list):
+        raise ValueError("Gemini did not return a JSON array")
+    return articles
 
 
 def insert_article_to_supabase(record):
@@ -139,24 +150,15 @@ Return strictly JSON in this format:
             temperature=0.1
         )
 
-        for model_name in GEMINI_MODELS:
-            try:
-                res = gemini_client.models.generate_content(
-                    model=model_name,
-                    contents=[pdf_part, prompt],
-                    config=config
-                )
-                if res and res.text:
-                    cleaned = re.sub(r'^```json\s*|\s*```$', '', res.text.strip(), flags=re.MULTILINE)
-                    articles = json.loads(cleaned)
-                    if isinstance(articles, list):
-                        return articles
-            except Exception as e:
-                print(f"⚠️ Gemini Native PDF Vision Warning [{model_name}]: {e}")
-                continue
+        return generate_content_with_fallback(
+            gemini_client,
+            contents=[pdf_part, prompt],
+            config=config,
+            parse=_parse_article_list,
+        )
 
     except Exception as err:
-        print(f"⚠️ Native PDF Processing Exception: {err}")
+        print(f"⚠️ Native PDF Processing Exception (models tried: {', '.join(GEMINI_MODELS)}): {err}")
 
     return []
 
@@ -181,19 +183,13 @@ Return strictly JSON array:
 """
     config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1) if types else None
 
-    for model_name in GEMINI_MODELS:
-        try:
-            res = gemini_client.models.generate_content(
-                model=model_name, contents=prompt, config=config
-            )
-            if res and res.text:
-                cleaned = re.sub(r'^```json\s*|\s*```$', '', res.text.strip(), flags=re.MULTILINE)
-                articles = json.loads(cleaned)
-                if isinstance(articles, list):
-                    return articles
-        except Exception:
-            continue
-    return []
+    try:
+        return generate_content_with_fallback(
+            gemini_client, contents=prompt, config=config, parse=_parse_article_list
+        )
+    except Exception as err:
+        print(f"⚠️ Gemini text parsing failed for page {page_no} (models tried: {', '.join(GEMINI_MODELS)}): {err}")
+        return []
 
 
 def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):

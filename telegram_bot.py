@@ -27,6 +27,9 @@ from supabase import create_client, Client
 from google import genai
 from google.genai import types
 
+import gemini_config
+from gemini_config import generate_content_with_fallback
+
 from telegram import Update
 from telegram.request import HTTPXRequest
 from telegram.error import TimedOut, NetworkError
@@ -63,7 +66,11 @@ SUPABASE_KEY = (
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Shared model defaults + fallback chain (GEMINI_MODEL / GEMINI_FALLBACK_MODELS).
+# The bot used to default to the legacy gemini-2.5-flash while the ingest
+# pipeline already ran on gemini-3.5-flash-lite; both now read gemini_config.
+GEMINI_MODEL = gemini_config.GEMINI_MODEL
+GEMINI_MODELS = gemini_config.GEMINI_MODELS
 
 NEWSPAPERS = ["မြန်မာ့အလင်း", "ကြေးမုံ"]
 
@@ -408,15 +415,15 @@ Return a valid JSON array of objects:
 If no clear prices/numbers are found, return [].
 """
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
+        items = generate_content_with_fallback(
+            client,
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
                 response_mime_type="application/json",
             ),
+            parse=json.loads,
         )
-        items = json.loads(response.text)
         if isinstance(items, list) and items:
             # Auto-save to newspaper_numbers
             for it in items:
@@ -533,7 +540,7 @@ DATABASE EVIDENCE:
 Provide a concise, professional Myanmar summary with newspaper citations.
 """
     try:
-        res = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        res = generate_content_with_fallback(client, contents=prompt)
         return (res.text or "").strip()
     except Exception as e:
         return f"⚠️ အယ်ဒီတာ့ သုံးသပ်ချက် ထုတ်ပြန်ရာတွင် အမှားဖြစ်ပေါ်ခဲ့သည်: {e}"
@@ -712,7 +719,7 @@ def main():
     print("🤖 Myanmar Intelligent Newsroom Bot (v7.0 Precision Edition) is starting...")
     print(f"🕘 Timezone: Asia/Yangon")
     print(f"📰 Monitored Papers: {', '.join(NEWSPAPERS)}")
-    print(f"🧠 Gemini model: {GEMINI_MODEL}")
+    print(f"🧠 Gemini models: {gemini_config.describe_models()}")
 
     t_request = HTTPXRequest(
         connect_timeout=30.0,
