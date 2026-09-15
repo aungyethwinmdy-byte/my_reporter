@@ -20,7 +20,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import requests
 import feedparser
@@ -46,10 +46,22 @@ SUPABASE_KEY = (
 )
 INDEPENDENT_TABLE_NAME = os.getenv("INDEPENDENT_TABLE_NAME", "independent_articles")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("❌ Supabase Credentials မပြည့်စုံပါ။ .env ဖိုင်ကို စစ်ဆေးပါ။")
+# NOTE: the client is created lazily (see get_supabase_client) so that importing
+# this module — unit tests, tooling, CI — never raises on missing credentials.
+_supabase_client: Optional[Client] = None
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def get_supabase_client() -> Optional[Client]:
+    global _supabase_client
+    if _supabase_client is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            return None
+        try:
+            _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception as exc:
+            logger.error("❌ Supabase init failed: %s", exc)
+            return None
+    return _supabase_client
 
 MYANMAR_TZ = timezone(timedelta(hours=6, minutes=30))
 
@@ -265,8 +277,13 @@ def save_articles_to_supabase(articles: List[Dict]) -> int:
     if not articles:
         return 0
 
+    client = get_supabase_client()
+    if not client:
+        logger.error("❌ Supabase credentials မပြည့်စုံပါ။ Sync ကျော်လိုက်ပါသည်။")
+        return 0
+
     try:
-        response = supabase.table(INDEPENDENT_TABLE_NAME).upsert(
+        response = client.table(INDEPENDENT_TABLE_NAME).upsert(
             articles,
             on_conflict="url",
             ignore_duplicates=True
@@ -307,4 +324,7 @@ def fetch_all() -> int:
 
 
 if __name__ == "__main__":
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise SystemExit("❌ Supabase Credentials မပြည့်စုံပါ။ .env ဖိုင်ကို စစ်ဆေးပါ။")
+
     fetch_all()

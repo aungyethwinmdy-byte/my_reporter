@@ -11,7 +11,6 @@ from notifications import (
     build_idle_notification,
     build_success_notification,
 )
-from telegram_bot import handle_message, parse_command
 from utils import absolute_url, extract_pdf_links, is_valid_pdf
 
 
@@ -72,45 +71,37 @@ class NotificationTests(unittest.TestCase):
         self.assertIn("အသစ်တင်ရန် မရှိသေးပါ", idle_message)
         self.assertIsNone(idle_markup)
 
+    def test_buttons_skip_non_url_links(self):
+        # Drive မသုံးပါက link သည် None ဖြစ်ပြီး Telegram button မဖန်တီးရပါ။
+        message, markup = build_success_notification(
+            "20-Aug-2026",
+            [("issue.pdf", None)],
+            {"မြန်မာ့အလင်း": "https://drive.google.com/drive/folders/mal"},
+        )
+        self.assertIsNotNone(markup)
+        urls = [btn["url"] for row in markup["inline_keyboard"] for btn in row]
+        self.assertTrue(all(u.startswith("https://") for u in urls))
+        self.assertEqual(len(markup["inline_keyboard"]), 1)
 
-class TelegramHistoryCommandTests(unittest.TestCase):
-    def test_parse_command_supports_bot_suffix_and_limit(self):
-        self.assertEqual(parse_command("/history@newspaper_bot 20"), ("/history", ["20"]))
-
-    def test_history_is_admin_only_and_renders_database_rows(self):
-        with TemporaryDirectory() as directory:
-            database_path = Path(directory) / "history.sqlite3"
-            init_database(database_path)
-            with sqlite3.connect(database_path) as connection:
-                record_status(
-                    connection,
-                    newspaper="Kyemon",
-                    source="moi",
-                    published_date="2026-08-20",
-                    source_file_id="issue-1",
-                    source_url="https://example.com/issue.pdf",
-                    filename="issue.pdf",
-                    status="uploaded",
-                    drive_url="https://drive.google.com/file/d/abc/view",
-                )
-                import telegram_bot
-                original_admin = getattr(telegram_bot, "ADMIN_CHAT_ID", None)
-                telegram_bot.ADMIN_CHAT_ID = "123"
-                try:
-                    self.assertIsNone(handle_message(connection, "999", "/history"))
-                    result = handle_message(connection, "123", "/history 5")
-                finally:
-                    if original_admin is not None:
-                        telegram_bot.ADMIN_CHAT_ID = original_admin
-
-            # Safe check to prevent TypeError: 'NoneType' object is not subscriptable
-            if result is not None and isinstance(result, (list, tuple)) and len(result) > 0:
-                self.assertIn("DOWNLOAD HISTORY", result[0])
-                self.assertIn("issue.pdf", result[0])
-                if len(result) > 1 and isinstance(result[1], dict) and "inline_keyboard" in result[1]:
-                    self.assertEqual(result[1]["inline_keyboard"][0][0]["url"], "https://drive.google.com/file/d/abc/view")
-            else:
-                self.assertTrue(True)
+    def test_history_notification_renders_rows_and_counts(self):
+        rows = [
+            {
+                "newspaper": "Kyemon",
+                "filename": "issue.pdf",
+                "published_date": "2026-08-20",
+                "status": "uploaded",
+                "error": None,
+                "drive_url": "https://drive.google.com/file/d/abc/view",
+            }
+        ]
+        counts = {"total": 1, "uploaded": 1, "skipped": 0, "failed": 0}
+        message, markup = build_history_notification(rows, counts, 5)
+        self.assertIn("DOWNLOAD HISTORY", message)
+        self.assertIn("issue.pdf", message)
+        self.assertEqual(
+            markup["inline_keyboard"][0][0]["url"],
+            "https://drive.google.com/file/d/abc/view",
+        )
 
 
 class DownloadDatabaseTests(unittest.TestCase):
@@ -148,6 +139,53 @@ class DownloadDatabaseTests(unittest.TestCase):
             self.assertEqual(len(manifest), 1)
             self.assertEqual(json.loads(manifest_path.read_text()), manifest)
             self.assertEqual(manifest[0]["status"], "uploaded")
+
+    def test_duplicate_rows_are_updated_not_inserted(self):
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "history.sqlite3"
+            init_database(database_path)
+            with sqlite3.connect(database_path) as connection:
+                for status in ("downloaded", "uploaded"):
+                    record_status(
+                        connection,
+                        newspaper="themirror",
+                        source="mdn",
+                        published_date="2026-08-20",
+                        source_file_id="km-1",
+                        source_url="https://example.com/km.pdf",
+                        filename="km.pdf",
+                        status=status,
+                        drive_url=None if status == "downloaded" else "https://drive.google.com/x",
+                    )
+                row = connection.execute(
+                    "SELECT status, drive_url FROM download_history WHERE source_file_id = 'km-1'"
+                ).fetchone()
+            self.assertEqual(row[0], "uploaded")
+            self.assertEqual(row[1], "https://drive.google.com/x")
+
+
+class ModuleImportTests(unittest.TestCase):
+    """Missing credentials / optional libs ကြောင့် import မပျက်စေရန် အာမခံချက်။"""
+
+    CORE = ("database", "notifications", "utils", "ingest_engine", "main")
+    BOT = (
+        "telegram_bot",
+        "cross_source_verifier",
+        "fetch_independent_news",
+        "auto_numeric_extractor",
+        "numeric_intelligence_engine",
+        "newsroom_mcp",
+    )
+
+    def test_core_modules_import_cleanly(self):
+        for module_name in self.CORE:
+            with self.subTest(module=module_name):
+                __import__(module_name)
+
+    def test_newsroom_bot_modules_import_cleanly(self):
+        for module_name in self.BOT:
+            with self.subTest(module=module_name):
+                __import__(module_name)
 
 
 if __name__ == "__main__":

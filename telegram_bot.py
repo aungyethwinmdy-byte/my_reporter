@@ -75,14 +75,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger("NewsroomBot")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("❌ Supabase Credentials မပြည့်စုံပါ။ .env ကို စစ်ဆေးပါ။")
+# NOTE: clients are created lazily (get_* below) so that importing this module
+# — unit tests, tooling, CI — never raises on missing credentials.
+_supabase_client: Client = None
+_genai_client = None
 
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("❌ TELEGRAM_BOT_TOKEN မရှိပါ။ .env ကို စစ်ဆေးပါ။")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+def get_supabase_client() -> Client:
+    global _supabase_client
+    if _supabase_client is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise RuntimeError("❌ Supabase Credentials မပြည့်စုံပါ။ .env ကို စစ်ဆေးပါ။")
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase_client
+
+
+def get_genai_client():
+    """GEMINI_API_KEY မရှိပါက None ပြန်ပေးပြီး bot ဆက်လည်ပါမည်။"""
+    global _genai_client
+    if _genai_client is None and GEMINI_API_KEY:
+        try:
+            _genai_client = genai.Client(api_key=GEMINI_API_KEY)
+        except Exception as exc:
+            logger.error("❌ Gemini init failed: %s", exc)
+    return _genai_client
 
 
 # ============================================================
@@ -604,6 +620,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
+        # Resolve clients per-request (lazily) instead of at import time.
+        supabase = get_supabase_client()
+        genai_client = get_genai_client()
+
         # ============================================================
         # PATH 1: DEDICATED PRECISION NUMERIC ROUTE
         # ============================================================
@@ -686,9 +706,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 def main():
+    if not TELEGRAM_BOT_TOKEN:
+        raise SystemExit("❌ TELEGRAM_BOT_TOKEN မရှိပါ။ .env ဖိုင်ကို စစ်ဆေးပါ။")
+
     print("🤖 Myanmar Intelligent Newsroom Bot (v7.0 Precision Edition) is starting...")
     print(f"🕘 Timezone: Asia/Yangon")
     print(f"📰 Monitored Papers: {', '.join(NEWSPAPERS)}")
+    print(f"🧠 Gemini model: {GEMINI_MODEL}")
 
     t_request = HTTPXRequest(
         connect_timeout=30.0,

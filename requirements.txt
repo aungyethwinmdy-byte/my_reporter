@@ -1,13 +1,41 @@
+# ---------- Core scraping / downloading ----------
 beautifulsoup4
+requests
+urllib3
+feedparser
+curl_cffi
+
+# ---------- Timezone ----------
+pytz
+tzdata
+
+# ---------- PDF text extraction (ingest_engine.py) ----------
+pypdf
+PyMuPDF
+
+# ---------- Database ----------
+supabase>=2.0.0
+
+# ---------- Google Drive uploader (main.py) ----------
 google-api-python-client
 google-auth
 google-auth-httplib2
 google-auth-oauthlib
-google-generativeai>=0.8.0
-pytz
-requests
-supabase>=2.0.0
-urllib3
-pyTelegramBotAPI>=4.20.0
-feedparser
-curl_cffi
+
+# ---------- Gemini ----------
+# NOTE: google-generativeai (old SDK, `google.generativeai`) is NOT used.
+# The code does `from google import genai`, which ships with google-genai.
+google-genai>=1.0.0
+
+# ---------- Telegram bot ----------
+# NOTE: the bot uses python-telegram-bot (`telegram` / `telegram.ext`),
+# NOT pyTelegramBotAPI (`telebot`). httpx backs telegram.request.HTTPXRequest.
+python-telegram-bot>=20.0
+httpx
+
+# ---------- Environment / config ----------
+python-dotenv
+
+# ---------- MCP server (newsroom_mcp.py) ----------
+mcp
+uvicorn

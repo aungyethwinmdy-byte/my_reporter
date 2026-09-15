@@ -26,7 +26,9 @@ except ImportError:
     Client = None
 
 # Configuration
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://zdsxuxwonkovuesjepfa.supabase.co")
+# NOTE: env only — a hardcoded fallback silently points ingestion at the
+# wrong Supabase project.
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
@@ -46,7 +48,13 @@ if GEMINI_API_KEY and genai:
     except Exception as e:
         print(f"⚠️ Gemini Init Error: {e}")
 
-GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-flash-latest"]
+# GEMINI_MODEL honours the same env var the GitHub Actions workflow exports.
+# Previously it was exported but never read, so the workflow default had no
+# effect at all.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-flash-latest"]
+
+GEMINI_MODELS = list(dict.fromkeys([GEMINI_MODEL] + GEMINI_FALLBACK_MODELS))
 
 
 def insert_article_to_supabase(record):
@@ -91,6 +99,11 @@ def extract_text_from_pdf(pdf_path):
     except Exception:
         pass
 
+    print(
+        "⚠️ pypdf/PyMuPDF ဖြင့် စာသား ထုတ်ယူ၍ မရပါ "
+        "(library မရှိခြင်း သို့မဟုတ် scanned PDF ဖြစ်ခြင်း)။ "
+        "Gemini Native PDF Vision သို့ ပြောင်းပါမည်။ `pip install pypdf PyMuPDF`"
+    )
     return pages_text
 
 
