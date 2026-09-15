@@ -9,3 +9,5 @@ requests
 supabase>=2.0.0
 urllib3
 pyTelegramBotAPI>=4.20.0
+feedparser
+curl_cffi
