@@ -1,0 +1,261 @@
+"""Unit tests for system router, multi-route dispatcher, and ingestion pipeline.
+
+Covers greeting/meta detection, sources count, system status, general conversation
+fallback chain, numeric ingestion flow with Burmese digit normalization, page-2-first
+search order, and scanned-PDF native vision fallback.
+"""
+
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import gemini_config
+from ingest_engine import extract_numbers_into_db, process_and_ingest_pdf
+from system_router import (
+    get_greeting_response,
+    get_sources_report,
+    get_system_status,
+    handle_general_ai_conversation,
+    is_greeting_or_casual,
+    is_system_meta_query,
+)
+from telegram_bot import execute_articles_search
+
+
+class RouterClassificationTests(unittest.TestCase):
+    def test_greeting_detection_positive_and_negative(self):
+        self.assertTrue(is_greeting_or_casual("မင်္ဂလာပါ"))
+        self.assertTrue(is_greeting_or_casual("hello"))
+        self.assertTrue(is_greeting_or_casual("ကျေးဇူးတင်ပါတယ်"))
+        self.assertFalse(is_greeting_or_casual("စက်သုံးဆီ ဈေးနှုန်း ဘယ်လောက်လဲ"))
+        self.assertFalse(is_greeting_or_casual(""))
+
+    def test_greeting_response_guidance(self):
+        resp = get_greeting_response()
+        self.assertIn("Myanmar Intelligent Newsroom", resp)
+        self.assertIn("/compare", resp)
+        self.assertIn("/sources", resp)
+
+    def test_system_meta_query_detection(self):
+        self.assertTrue(is_system_meta_query("သတင်းဌာန ဘယ်နှစ်ခုလဲ"))
+        self.assertTrue(is_system_meta_query("ဘယ်မီဒီယာတွေ ပါလဲ"))
+        self.assertTrue(is_system_meta_query("စနစ်အခြေအနေ status"))
+        self.assertFalse(is_system_meta_query("တောင်ငူ ရေကြီးမှု သတင်း"))
+        self.assertFalse(is_system_meta_query(""))
+
+    def test_sources_report_total_and_breakdown(self):
+        report = get_sources_report()
+        self.assertIn("(6)", report)
+        self.assertIn("မြန်မာ့အလင်း သတင်းစာ", report)
+        self.assertIn("ကြေးမုံ သတင်းစာ", report)
+        self.assertIn("BBC Burmese", report)
+        self.assertIn("The Irrawaddy", report)
+        self.assertIn("RFA Burmese", report)
+        self.assertIn("PPIB", report)
+
+
+class SystemStatusTests(unittest.TestCase):
+    def test_system_status_with_none_client(self):
+        status = get_system_status(None)
+        self.assertIn("System Status", status)
+        self.assertIn("0 ပုဒ်", status)
+        self.assertIn("0 ခု", status)
+        self.assertIn("မသိရှိပါ", status)
+
+    def test_system_status_with_broken_client(self):
+        broken = MagicMock()
+        broken.from_.side_effect = RuntimeError("database disconnected")
+        status = get_system_status(broken)
+        self.assertIn("System Status", status)
+        self.assertIn("0 ပုဒ်", status)
+        self.assertIn("0 ခု", status)
+
+    def test_system_status_with_valid_client(self):
+        client = MagicMock()
+        art_res = MagicMock(count=120, data=[])
+        num_res = MagicMock(count=45, data=[])
+        date_res = MagicMock(data=[{"issue_date": "2026-09-17"}])
+
+        def fake_from(table_name):
+            builder = MagicMock()
+            if table_name == "articles":
+                def fake_select(cols, count=None):
+                    sel_mock = MagicMock()
+                    if count == "exact":
+                        sel_mock.limit.return_value.execute.return_value = art_res
+                    else:
+                        sel_mock.order.return_value.limit.return_value.execute.return_value = date_res
+                    return sel_mock
+                builder.select = fake_select
+            elif table_name == "newspaper_numbers":
+                sel_mock = MagicMock()
+                sel_mock.limit.return_value.execute.return_value = num_res
+                builder.select.return_value = sel_mock
+            return builder
+
+        client.from_ = fake_from
+        status = get_system_status(client)
+        self.assertIn("120 ပုဒ်", status)
+        self.assertIn("45 ခု", status)
+        self.assertIn("2026-09-17", status)
+
+
+class GeneralConversationTests(unittest.TestCase):
+    def test_general_ai_conversation_with_none_client(self):
+        answer = handle_general_ai_conversation("မင်္ဂလာပါ", None)
+        self.assertIn("မြန်မာ့သတင်းစောင့်ကြည့်ရေး", answer)
+
+    def test_general_ai_conversation_fallback_chain(self):
+        calls = []
+
+        class FakeModels:
+            def generate_content(self, *, model, contents, config=None):
+                calls.append(model)
+                if model == gemini_config.GEMINI_MODELS[0]:
+                    raise RuntimeError("429 Resource Exhausted")
+                return SimpleNamespace(text="ဒါက ဒုတိယ model အဖြေဖြစ်ပါတယ်။")
+
+        fake_client = SimpleNamespace(models=FakeModels())
+        ans = handle_general_ai_conversation("ဘာလုပ်ပေးနိုင်လဲ", fake_client)
+        self.assertEqual(ans, "ဒါက ဒုတိယ model အဖြေဖြစ်ပါတယ်။")
+        self.assertEqual(calls, [gemini_config.GEMINI_MODELS[0], gemini_config.GEMINI_MODELS[1]])
+
+
+class IngestAndSearchTests(unittest.TestCase):
+    @patch("ingest_engine.supabase")
+    @patch("ingest_engine.gemini_client")
+    def test_ingest_numeric_flow_normalizes_burmese_digits(self, mock_gemini, mock_supabase):
+        extracted = [
+            {
+                "context": "Octane 92",
+                "value": "၃,၀၅၀",
+                "original_value": "၃,၀၅၀",
+                "unit": "ကျပ်",
+                "source_text": "Octane 92 တစ်လီတာ ၃,၀၅၀ ကျပ်",
+            }
+        ]
+        inserted_rows = []
+        mock_table = MagicMock()
+        mock_table.insert.side_effect = lambda rows: MagicMock(execute=lambda: inserted_rows.extend(rows))
+        mock_supabase.from_.return_value = mock_table
+
+        with patch("ingest_engine.extract_numbers_from_article", return_value=extracted):
+            extract_numbers_into_db(
+                headline="စက်သုံးဆီ ဈေးနှုန်း ထုတ်ပြန်",
+                body_text="Octane 92 တစ်လီတာ ၃,၀၅၀ ကျပ်ဖြင့် ရောင်းချလျက်ရှိသည်။",
+                pub_date="2026-09-17",
+                section="စက်သုံးဆီ",
+            )
+
+        self.assertEqual(len(inserted_rows), 1)
+        self.assertEqual(inserted_rows[0]["value"], "3050")
+        self.assertEqual(inserted_rows[0]["original_value"], "၃,၀၅၀")
+        self.assertEqual(inserted_rows[0]["context"], "Octane 92")
+
+    @patch("ingest_engine.supabase")
+    @patch("ingest_engine.gemini_client")
+    def test_ingest_numeric_flow_skips_when_no_digits(self, mock_gemini, mock_supabase):
+        with patch("ingest_engine.extract_numbers_from_article") as mock_extract:
+            extract_numbers_into_db(
+                headline="ခေါင်းစဉ်",
+                body_text="ဂဏန်းလုံးဝမပါသော သာမန်စာသားဖြစ်ပါသည်။",
+                pub_date="2026-09-17",
+            )
+            mock_extract.assert_not_called()
+
+    def test_execute_articles_search_page_2_first_order(self):
+        mock_supabase = MagicMock()
+        p2_record = {
+            "article_id": "art-p2",
+            "newspaper_name": "မြန်မာ့အလင်း",
+            "issue_date": "2026-09-17",
+            "page_no": 2,
+            "headline": "Page 2 News",
+            "body_text": "body",
+        }
+        kw_record = {
+            "article_id": "art-kw",
+            "newspaper_name": "မြန်မာ့အလင်း",
+            "issue_date": "2026-09-17",
+            "page_no": 5,
+            "headline": "Octane News",
+            "body_text": "body",
+        }
+
+        def fake_from(table):
+            builder = MagicMock()
+            def fake_select(*cols):
+                sel = MagicMock()
+                def fake_eq(col, val):
+                    eq_mock = MagicMock()
+                    if col == "page_no" and val == 2:
+                        eq_mock.limit.return_value.execute.return_value = MagicMock(data=[p2_record])
+                    else:
+                        eq_mock.ilike.return_value.eq.side_effect = fake_eq
+                        eq_mock.ilike.return_value.or_.return_value.limit.return_value.execute.return_value = MagicMock(data=[kw_record])
+                    return eq_mock
+                sel.eq.side_effect = fake_eq
+                return sel
+            builder.select = fake_select
+            return builder
+
+        mock_supabase.from_ = fake_from
+        results = execute_articles_search(mock_supabase, ["Octane"], ["2026-09-17"])
+        self.assertGreaterEqual(len(results), 2)
+        self.assertEqual(results[0]["article_id"], "art-p2")
+        self.assertEqual(results[0]["page_no"], 2)
+        self.assertEqual(results[1]["article_id"], "art-kw")
+
+    def test_execute_articles_search_sanitizes_keywords(self):
+        mock_supabase = MagicMock()
+        captured_or = []
+
+        def fake_from(table):
+            builder = MagicMock()
+            sel = MagicMock()
+            eq1 = MagicMock()
+            ilike1 = MagicMock()
+
+            builder.select.return_value = sel
+            sel.eq.return_value = eq1
+            eq1.ilike.return_value = ilike1
+            ilike1.eq.return_value.limit.return_value.execute.return_value = MagicMock(data=[])
+
+            def fake_or(clause):
+                captured_or.append(clause)
+                m = MagicMock()
+                m.limit.return_value.execute.return_value = MagicMock(data=[])
+                return m
+
+            ilike1.or_ = fake_or
+            return builder
+
+        mock_supabase.from_ = fake_from
+        execute_articles_search(mock_supabase, ["octane;", "price'--"], ["2026-09-17"])
+        for clause in captured_or:
+            self.assertNotIn(";", clause)
+            self.assertNotIn("'", clause)
+
+    @patch("ingest_engine.supabase")
+    @patch("ingest_engine.extract_text_from_pdf", return_value=[])
+    @patch("ingest_engine.extract_page2_tables", return_value=[])
+    @patch("ingest_engine.parse_articles_with_gemini_native_pdf")
+    @patch("ingest_engine.insert_article_to_supabase", return_value=True)
+    def test_process_and_ingest_pdf_scanned_pdf_native_vision_fallback(
+        self, mock_insert, mock_native_pdf, mock_p2, mock_extract_text, mock_supabase
+    ):
+        mock_native_pdf.return_value = [
+            {"headline": "Scanned Vision Article", "body_text": "Extracted with Gemini Native Vision", "page_no": 1}
+        ]
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+            ok = process_and_ingest_pdf(tmp.name, "မြန်မာ့အလင်း", "2026-09-17")
+            self.assertTrue(ok)
+            mock_native_pdf.assert_called_once_with(tmp.name, "မြန်မာ့အလင်း", "2026-09-17")
+            mock_insert.assert_called_once()
+            record = mock_insert.call_args[0][0]
+            self.assertEqual(record["headline"], "Scanned Vision Article")
+
+
+if __name__ == "__main__":
+    unittest.main()

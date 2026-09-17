@@ -23,9 +23,13 @@ BURMESE_DIGIT_MAP = str.maketrans("၀၁၂၃၄၅၆၇၈၉", "0123456789"
 def clean_number(val_str: str) -> str:
     """မြန်မာဂဏန်းများကို အင်္ဂလိပ်ဂဏန်း ပြောင်းလဲပြီး ကော်မာများ ဖြုတ်ခြင်း"""
     val = (val_str or "").translate(BURMESE_DIGIT_MAP)
-    # Extract only numeric tokens with optional decimal
     match = re.search(r"[-+]?\d+(?:\.\d+)?", val.replace(",", ""))
-    return match.group(0) if match else val_str
+    return match.group(0) if match else str(val_str)
+
+
+def _parse_extracted_json(text: str):
+    cleaned = re.sub(r"^```json\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
+    return json.loads(cleaned)
 
 
 def extract_numbers_from_article(
@@ -51,7 +55,7 @@ Analyze the following text and extract EVERY specific price, rate, quota, statis
 Date: {publication_date}
 Headline: {headline}
 Text:
-{article_text}
+{article_text[:4000]}
 
 Extract each figure into this JSON structure:
 [
@@ -79,7 +83,7 @@ Rules:
                 response_mime_type="application/json",
             ),
             models=resolve_models(model_name),
-            parse=json.loads,
+            parse=_parse_extracted_json,
         )
         return data if isinstance(data, list) else []
     except Exception as e:
@@ -88,21 +92,26 @@ Rules:
 
 
 def ingest_article_numbers(
-    supabase_client: Client,
-    genai_client: genai.Client,
+    supabase_client: Optional[Client],
+    genai_client: Optional[genai.Client],
     article_id: str,
     publication_date: str,
     headline: str,
     body_text: str,
     section: str = "အထွေထွေ",
+    model_name: Optional[str] = None,
 ):
     """ထုတ်ယူရရှိသော ဂဏန်းများကို `newspaper_numbers` သို့ အလိုအလျောက် သွင်းယူခြင်း"""
+    if not supabase_client or not genai_client:
+        return
+
     extracted_numbers = extract_numbers_from_article(
         article_text=body_text,
         headline=headline,
         publication_date=publication_date,
         section=section,
         genai_client=genai_client,
+        model_name=model_name,
     )
 
     if not extracted_numbers:
@@ -125,6 +134,6 @@ def ingest_article_numbers(
 
     try:
         supabase_client.from_("newspaper_numbers").insert(rows_to_insert).execute()
-        logger.info(f"✅ Ingested {len(rows_to_insert)} numbers for article: {headline[:40]}")
+        logger.info("✅ Ingested %d numbers for article: %s", len(rows_to_insert), headline[:40])
     except Exception as e:
-        logger.error(f"❌ Failed to insert into newspaper_numbers: {e}")
+        logger.error("❌ Failed to insert into newspaper_numbers: %s", e)

@@ -121,8 +121,58 @@ class PrecisionReportTests(unittest.TestCase):
         self.assertIn("2026-09-13", report)
         self.assertIn("2026-09-14", report)
         self.assertIn("Octane 92", report)
-        # Difference is 200 and must be computed, not hallucinated.
-        self.assertIn("200", report)
+        # Difference is +200 and must be computed, not hallucinated.
+        self.assertIn("+၂၀၀", report)
+        self.assertIn("တက်", report)
+
+    def test_comparison_report_decrease_case(self):
+        rows = [
+            {
+                "publication_date": "2026-09-13",
+                "context": "Diesel",
+                "value": 3100.0,
+                "original_value": "3,100",
+                "unit": "ကျပ်",
+                "headline": "စက်သုံးဆီ ရည်ညွှန်းဈေး",
+            },
+            {
+                "publication_date": "2026-09-14",
+                "context": "Diesel",
+                "value": 3050.0,
+                "original_value": "3,050",
+                "unit": "ကျပ်",
+                "headline": "စက်သုံးဆီ ရည်ညွှန်းဈေး",
+            },
+        ]
+        report = build_precision_numeric_report(
+            data_rows=rows,
+            dates=["2026-09-13", "2026-09-14"],
+            user_query="မနေ့က နဲ့ ဒီနေ့ ဒီဇယ်ဈေး နှိုင်းယှဉ်ပြပါ",
+            title_override="စက်သုံးဆီ ဈေးနှုန်းများ",
+        )
+        self.assertIsInstance(report, str)
+        self.assertIn("-၅၀", report)
+        self.assertIn("ကျ", report)
+
+    def test_single_date_report_formats_burmese_digits_without_trailing_zero(self):
+        rows = [
+            {
+                "publication_date": "2026-09-14",
+                "context": "Diesel",
+                "value": 3150.0,
+                "unit": "ကျပ်",
+                "headline": "စက်သုံးဆီ ရည်ညွှန်းဈေး",
+            },
+        ]
+        report = build_precision_numeric_report(
+            data_rows=rows,
+            dates=["2026-09-14"],
+            user_query="ဒီနေ့ ဒီဇယ်ဈေး",
+            title_override="စက်သုံးဆီ ဈေးနှုန်းများ",
+        )
+        self.assertIsInstance(report, str)
+        self.assertIn("၃,၁၅၀", report)
+        self.assertNotIn(".0", report)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import contextlib
 import json
 import sqlite3
 import unittest
@@ -110,7 +111,7 @@ class DownloadDatabaseTests(unittest.TestCase):
             database_path = Path(directory) / "history.sqlite3"
             manifest_path = Path(directory) / "manifest.json"
             init_database(database_path)
-            with sqlite3.connect(database_path) as connection:
+            with contextlib.closing(sqlite3.connect(database_path)) as connection:
                 record_status(
                     connection,
                     newspaper="Myanma_Alinn",
@@ -144,7 +145,7 @@ class DownloadDatabaseTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "history.sqlite3"
             init_database(database_path)
-            with sqlite3.connect(database_path) as connection:
+            with contextlib.closing(sqlite3.connect(database_path)) as connection:
                 for status in ("downloaded", "uploaded"):
                     record_status(
                         connection,
@@ -175,6 +176,8 @@ class ModuleImportTests(unittest.TestCase):
         "auto_numeric_extractor",
         "numeric_intelligence_engine",
         "newsroom_mcp",
+        "report_formatter",
+        "system_router",
     )
 
     def test_core_modules_import_cleanly(self):

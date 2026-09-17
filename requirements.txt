@@ -12,6 +12,7 @@ tzdata
 # ---------- PDF text extraction (ingest_engine.py) ----------
 pypdf
 PyMuPDF
+pdfplumber
 
 # ---------- Database ----------
 supabase>=2.0.0
