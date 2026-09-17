@@ -1,16 +1,11 @@
 """
 ================================================================
-MYANMAR INTELLIGENT NEWSROOM BOT (v7.0 Precision Edition)
-Precision Numeric & Commodity Intelligence + Dual-Date Comparison
-================================================================
-Features:
-1. Exact Number & Commodity Engine querying `newspaper_numbers`
-2. Zero-Hallucination Python Mathematical Calculation for Price Changes (+/-)
-3. Multi-Commodity Support (Fuel, Gold, Foreign Exchange, Crops, Statistics)
-4. Auto-Cache Fallback (Extracts & caches numbers into DB if missing)
-5. Asia/Yangon Timezone Guaranteed
-6. Cross-Source Fact-Checking (/compare)
-7. Full Context Continuity across conversation turns
+MYANMAR INTELLIGENT NEWSROOM BOT (v7.3 Stable Edition)
+- Fixed: Removed ClientOptions incompatibility with supabase-py
+- Greeting Filter: Clean greetings without unwanted news dumps
+- Precision Numeric Engine: Exact fuel & gold price comparisons
+- Custom Commands: /start, /help, /sources, /status, /compare
+- Lazy Client Init: CI tests will never crash on import
 ================================================================
 """
 
@@ -38,6 +33,17 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# Custom Modules
+from report_formatter import format_numeric_dashboard, clean_number_value
+from system_router import (
+    is_greeting_or_casual,
+    get_greeting_response,
+    is_system_meta_query,
+    get_sources_report,
+    get_system_status,
+    handle_general_ai_conversation,
+)
+
 # Optional Cross-Source Verifier
 try:
     from cross_source_verifier import run_cross_source_comparison
@@ -46,7 +52,7 @@ except ImportError:
 
 
 # ============================================================
-# 1. CONFIGURATION & CLIENT INITIALIZATION
+# 1. CONFIGURATION & CLIENT MANAGEMENT (STABLE LAZY INIT)
 # ============================================================
 
 MYANMAR_TZ = ZoneInfo("Asia/Yangon")
@@ -60,14 +66,11 @@ SUPABASE_KEY = (
     or os.getenv("SUPABASE_KEY")
     or os.getenv("SUPABASE_ANON_KEY")
 )
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 NEWSPAPERS = ["မြန်မာ့အလင်း", "ကြေးမုံ"]
-
-BURMESE_DIGIT_MAP = str.maketrans("၀၁၂၃၄၅၆၇၈၉", "0123456789")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -75,60 +78,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger("NewsroomBot")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("❌ Supabase Credentials မပြည့်စုံပါ။ .env ကို စစ်ဆေးပါ။")
+_supabase_client: Client = None
+_genai_client = None
 
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("❌ TELEGRAM_BOT_TOKEN မရှိပါ။ .env ကို စစ်ဆေးပါ။")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+def get_supabase_client() -> Client:
+    """Standard Lazy getter for Supabase Client."""
+    global _supabase_client
+    if _supabase_client is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise RuntimeError("❌ Supabase Credentials မပြည့်စုံပါ။ .env ကို စစ်ဆေးပါ။")
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase_client
+
+
+def get_genai_client():
+    """Lazy getter for Gemini Client."""
+    global _genai_client
+    if _genai_client is None and GEMINI_API_KEY:
+        try:
+            _genai_client = genai.Client(api_key=GEMINI_API_KEY)
+        except Exception as exc:
+            logger.error("❌ Gemini init failed: %s", exc)
+    return _genai_client
 
 
 # ============================================================
-# 2. DATE & NUMERIC HELPERS
+# 2. DATE & TELEGRAM HELPERS
 # ============================================================
 
 def get_myanmar_dates() -> tuple[str, str]:
-    """Always return today and yesterday in Myanmar Time (Asia/Yangon)."""
+    """Always calculate today and yesterday in Myanmar Time."""
     now_mm = datetime.now(MYANMAR_TZ)
     today_str = now_mm.strftime("%Y-%m-%d")
     yesterday_str = (now_mm - timedelta(days=1)).strftime("%Y-%m-%d")
     return today_str, yesterday_str
 
 
-def normalize_digits(text: str) -> str:
-    """မြန်မာဂဏန်းများကို အင်္ဂလိပ်ဂဏန်းအဖြစ် ပြောင်းလဲခြင်း"""
-    return (text or "").translate(BURMESE_DIGIT_MAP)
-
-
-def clean_number_value(val_str: str) -> float | None:
-    """ဂဏန်းစာသားမှ ကော်မာများ ဖြုတ်ပြီး Float သို့ ပြောင်းခြင်း"""
-    if val_str is None:
-        return None
-    s = normalize_digits(str(val_str)).replace(",", "").strip()
-    match = re.search(r"[-+]?\d+(?:\.\d+)?", s)
-    if match:
-        try:
-            return float(match.group(0))
-        except ValueError:
-            return None
-    return None
-
-
-# ============================================================
-# 3. TELEGRAM DELIVERY HELPERS
-# ============================================================
-
-async def safe_send_or_edit(
-    message_obj,
-    text: str,
-    is_edit: bool = False,
-    update_context=None,
-):
-    """Send or edit messages with markdown fallback to plain text."""
+async def safe_send_or_edit(message_obj, text: str, is_edit: bool = False, update_context=None):
+    """Send or edit telegram messages with retry and plain text fallback."""
     clean_text = text.replace("*", "").replace("_", "").replace("`", "")
-
     for attempt in range(3):
         try:
             if is_edit and message_obj:
@@ -141,7 +130,7 @@ async def safe_send_or_edit(
                 continue
             logger.warning("⚠️ Network timeout during delivery: %s", e)
         except Exception as e:
-            logger.warning("Markdown parse failed, fallback to plain text: %s", e)
+            logger.warning("Markdown parse failed, retrying plain text: %s", e)
             try:
                 if is_edit and message_obj:
                     return await message_obj.edit_text(clean_text)
@@ -188,7 +177,7 @@ def split_message_text(text: str, max_length: int = 3500) -> list[str]:
 
 
 # ============================================================
-# 4. NUMERIC & PRICE INTELLIGENCE ENGINE (CORE SYSTEM)
+# 3. NUMERIC & COMMODITY DATABASE ENGINE
 # ============================================================
 
 def is_numeric_or_price_query(query: str) -> bool:
@@ -204,7 +193,7 @@ def is_numeric_or_price_query(query: str) -> bool:
 
 
 def detect_commodity_context(query: str) -> str:
-    """မေးခွန်းအတွင်းမှ အဓိက ကုန်စည်/ကဏ္ဍ Keyword ကို သတ်မှတ်ခြင်း"""
+    """မေးခွန်းအတွင်းမှ အဓိက ကုန်စည်အမျိုးအမည်ကို သတ်မှတ်ခြင်း"""
     low = query.lower()
     if any(k in low for k in ["စက်သုံးဆီ", "ဓာတ်ဆီ", "ဒီဇယ်", "ဒဇယ်", "octane", "diesel", "ဆီ"]):
         return "စက်သုံးဆီ"
@@ -219,137 +208,32 @@ def detect_commodity_context(query: str) -> str:
     return ""
 
 
-def query_newspaper_numbers(
-    supabase_client: Client,
-    search_term: str,
-    dates: list[str],
-) -> list[dict]:
-    """Supabase `newspaper_numbers` ဇယားမှ သတ်မှတ်ရက်စွဲအလိုက် ကိန်းဂဏန်းများ ဆွဲထုတ်ခြင်း"""
-    try:
-        query = (
-            supabase_client.from_("newspaper_numbers")
-            .select("publication_date, headline, section, context, value, original_value, unit, source_text")
-            .in_("publication_date", dates)
-        )
-        if search_term:
-            query = query.or_(
-                f"context.ilike.%{search_term}%,headline.ilike.%{search_term}%,section.ilike.%{search_term}%"
+def query_newspaper_numbers(supabase_client: Client, search_term: str, dates: list[str]) -> list[dict]:
+    """Supabase `newspaper_numbers` ဇယားမှ သတ်မှတ်ရက်စွဲအလိုက် ကိန်းဂဏန်းများ ဆွဲထုတ်ခြင်း (with Retry)"""
+    for attempt in range(2):
+        try:
+            query = (
+                supabase_client.from_("newspaper_numbers")
+                .select("publication_date, headline, section, context, value, original_value, unit, source_text")
+                .in_("publication_date", dates)
             )
-        res = query.order("publication_date", desc=False).execute()
-        return res.data or []
-    except Exception as e:
-        logger.warning("Query newspaper_numbers failed: %s", e)
-        return []
+            if search_term:
+                query = query.or_(
+                    f"context.ilike.%{search_term}%,headline.ilike.%{search_term}%,section.ilike.%{search_term}%"
+                )
+            res = query.order("publication_date", desc=False).execute()
+            return res.data or []
+        except Exception as e:
+            logger.warning("Query attempt %d for numbers failed: %s", attempt + 1, e)
+            if attempt == 0:
+                import time
+                time.sleep(2)
+                continue
+    return []
 
 
-def build_precision_numeric_report(
-    data_rows: list[dict],
-    dates: list[str],
-    user_query: str,
-    title_override: str = "",
-) -> str:
-    """
-    Python Mathematical Calculation Engine
-    Zero-Hallucination: တက်/ကျ ကိန်းဂဏန်း ကွာခြားချက်ကို Python ဖြင့် တိုက်ရိုက်တွက်ချက်ခြင်း
-    """
-    if not data_rows:
-        return ""
-
-    is_comparison = len(dates) == 2
-    d_yesterday, d_today = (dates[0], dates[1]) if is_comparison else (None, dates[0])
-
-    # Group records by (context / item name)
-    grouped = {}
-    for r in data_rows:
-        ctx = r.get("context") or r.get("headline")
-        dt = str(r.get("publication_date"))
-        if ctx not in grouped:
-            grouped[ctx] = {"unit": r.get("unit") or "ကျပ်", "dates": {}}
-        grouped[ctx]["dates"][dt] = r
-
-    title = title_override or "သတင်းစာ ကိန်းဂဏန်းနှင့် ဈေးနှုန်း နှိုင်းယှဉ်ချက်"
-
-    lines = [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 **{title}**",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📌 **မေးမြန်းချက်:** {user_query}",
-        f"🗓 **ရက်စွဲ အကျုံးဝင်မှု:** {' နှင့် '.join(dates)}\n",
-    ]
-
-    if is_comparison:
-        lines.append(f"| အမျိုးအမည် / အညွှန်း | {d_yesterday} | {d_today} | အပြောင်းအလဲ | ယူနစ် |")
-        lines.append("|---|---:|---:|---:|:---|")
-    else:
-        lines.append(f"| အမျိုးအမည် / အညွှန်း | ဈေးနှုန်း / တန်ဖိုး | ယူနစ် |")
-        lines.append("|---|---:|:---|")
-
-    evidence_list = []
-
-    for ctx, info in grouped.items():
-        unit = info["unit"]
-        if is_comparison:
-            y_rec = info["dates"].get(d_yesterday)
-            t_rec = info["dates"].get(d_today)
-
-            y_str = y_rec.get("original_value") or str(y_rec.get("value")) if y_rec else "မပါရှိပါ"
-            t_str = t_rec.get("original_value") or str(t_rec.get("value")) if t_rec else "မပါရှိပါ"
-
-            diff_str = "မတွက်ချက်နိုင်ပါ"
-            if y_rec and t_rec:
-                y_val = clean_number_value(y_rec.get("value"))
-                t_val = clean_number_value(t_rec.get("value"))
-                if y_val is not None and t_val is not None:
-                    diff = t_val - y_val
-                    if diff == 0:
-                        diff_str = "မပြောင်းလဲ"
-                    elif diff > 0:
-                        diff_str = f"+{int(diff) if diff.is_integer() else diff:g}"
-                    else:
-                        diff_str = f"{int(diff) if diff.is_integer() else diff:g}"
-
-            lines.append(f"| {ctx} | {y_str} | {t_str} | {diff_str} | {unit} |")
-
-            for rec in [t_rec, y_rec]:
-                if rec and rec.get("source_text"):
-                    entry = f"• **{ctx}** ({rec['publication_date']}): {rec['source_text']}"
-                    if entry not in evidence_list:
-                        evidence_list.append(entry)
-        else:
-            rec = info["dates"].get(d_today)
-            val_str = rec.get("original_value") or str(rec.get("value")) if rec else "မပါရှိပါ"
-            lines.append(f"| {ctx} | {val_str} | {unit} |")
-            if rec and rec.get("source_text"):
-                evidence_list.append(f"• **{ctx}**: {rec['source_text']}")
-
-    report = "\n".join(lines)
-    if evidence_list:
-        report += "\n\n🏛 **မူရင်း သတင်းစာအထောက်အထား:**\n" + "\n".join(evidence_list[:8])
-
-    report += (
-        "\n\n💡 **အယ်ဒီတာ့ သုံးသပ်ချက်:**\n"
-        "ဖော်ပြပါ ကိန်းဂဏန်းများသည် သတင်းစာပါ အချက်အလက်များအား "
-        "တိကျစွာ ထုတ်ယူတွက်ချက်ထားခြင်းဖြစ်ပြီး ခန့်မှန်းဖော်ပြထားခြင်း မရှိပါ။\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    return report
-
-
-# ============================================================
-# 5. AUTO-CACHE / LLM NUMERIC REPAIR (FALLBACK)
-# ============================================================
-
-def extract_and_cache_missing_numbers(
-    client: genai.Client,
-    supabase_client: Client,
-    retrieved_articles: list[dict],
-    dates: list[str],
-    commodity_keyword: str,
-) -> list[dict]:
-    """
-    If `newspaper_numbers` does not have numbers yet, extract them from
-    retrieved articles and auto-save into `newspaper_numbers` for future queries!
-    """
+def extract_and_cache_missing_numbers(client, supabase_client: Client, retrieved_articles: list[dict], dates: list[str], commodity_keyword: str) -> list[dict]:
+    """Auto-cache numbers into `newspaper_numbers` if not found in table."""
     if not client or not retrieved_articles:
         return []
 
@@ -369,13 +253,11 @@ def extract_and_cache_missing_numbers(
     prompt = f"""
 You are an expert financial and commodity extraction engine for Myanmar newspapers.
 Extract all specific prices, rates, yields, or metrics for: {commodity_keyword or 'all commodities'}
-
-DATES TO EXTRACT: {dates}
-
-TEXT EVIDENCE:
+DATES: {dates}
+EVIDENCE:
 {joined_text}
 
-Return a valid JSON array of objects:
+Return ONLY a valid JSON array of objects:
 [
   {{
     "publication_date": "YYYY-MM-DD",
@@ -385,29 +267,24 @@ Return a valid JSON array of objects:
     "value": "plain english number (e.g. 3050)",
     "original_value": "burmese number as written (e.g. ၃,၀၅၀)",
     "unit": "ကျပ် or unit",
-    "source_text": "verbatim short snippet"
+    "source_text": "verbatim snippet"
   }}
 ]
-
-If no clear prices/numbers are found, return [].
+If none, return [].
 """
     try:
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                response_mime_type="application/json",
-            ),
+            config=types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json"),
         )
         items = json.loads(response.text)
         if isinstance(items, list) and items:
-            # Auto-save to newspaper_numbers
             for it in items:
                 it["value"] = str(clean_number_value(it.get("value")) or it.get("value"))
             try:
                 supabase_client.from_("newspaper_numbers").insert(items).execute()
-                logger.info("💾 Auto-cached %d new numeric items into DB.", len(items))
+                logger.info("💾 Auto-cached %d items into newspaper_numbers.", len(items))
             except Exception as e:
                 logger.warning("Auto-cache insert failed: %s", e)
             return items
@@ -418,85 +295,60 @@ If no clear prices/numbers are found, return [].
 
 
 # ============================================================
-# 6. GENERAL ARTICLE SEARCH (STANDARD ENGINE)
+# 4. ARTICLE SEARCH & EDITORIAL RESPONSE
 # ============================================================
 
-def execute_articles_search(
-    supabase_client: Client,
-    search_terms: list[str],
-    dates: list[str],
-) -> list[dict]:
-    """General text search across `articles` view."""
+def execute_articles_search(supabase_client: Client, search_terms: list[str], dates: list[str]) -> list[dict]:
+    """Search articles strictly matching query terms across dates."""
+    if not search_terms:
+        return []
+
     all_rows = []
     seen = set()
+    clean_terms = [re.sub(r"[,;\'\"()%]", "", kw).strip() for kw in search_terms if len(kw.strip()) >= 2]
+
+    if not clean_terms:
+        return []
+
+    or_clauses = [f"headline.ilike.%{kw}%,body_text.ilike.%{kw}%" for kw in clean_terms[:5]]
 
     for dt in dates:
         for paper in NEWSPAPERS:
-            # Always get Page 2 first
             try:
-                p2 = (
+                res = (
                     supabase_client.from_("articles")
                     .select("article_id, newspaper_name, issue_date, page_no, headline, body_text")
                     .eq("issue_date", dt)
                     .ilike("newspaper_name", f"%{paper}%")
-                    .eq("page_no", 2)
-                    .limit(20)
+                    .or_(",".join(or_clauses))
+                    .limit(10)
                     .execute()
                 )
-                for r in p2.data or []:
+                for r in res.data or []:
                     aid = r.get("article_id")
                     if aid not in seen:
                         seen.add(aid)
                         all_rows.append(r)
             except Exception as e:
-                logger.warning("Page 2 query error: %s", e)
-
-            # Keyword query
-            if search_terms:
-                or_clauses = [
-                    f"headline.ilike.%{kw}%,body_text.ilike.%{kw}%"
-                    for kw in search_terms[:5]
-                ]
-                try:
-                    res = (
-                        supabase_client.from_("articles")
-                        .select("article_id, newspaper_name, issue_date, page_no, headline, body_text")
-                        .eq("issue_date", dt)
-                        .ilike("newspaper_name", f"%{paper}%")
-                        .or_(",".join(or_clauses))
-                        .limit(10)
-                        .execute()
-                    )
-                    for r in res.data or []:
-                        aid = r.get("article_id")
-                        if aid not in seen:
-                            seen.add(aid)
-                            all_rows.append(r)
-                except Exception as e:
-                    logger.warning("Keyword query error: %s", e)
+                logger.warning("Keyword query error for %s / %s: %s", paper, dt, e)
 
     return all_rows
 
 
-def generate_general_editorial_response(
-    client: genai.Client,
-    user_query: str,
-    retrieved_articles: list[dict],
-    dates: list[str],
-) -> str:
-    """Fallback editorial response for non-numeric narrative queries."""
+def generate_general_editorial_response(client, user_query: str, retrieved_articles: list[dict], dates: list[str]) -> str:
+    """Editorial response using verified database context."""
     if not retrieved_articles:
         return (
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "📰 **သတင်းမီဒီယာ စောင့်ကြည့်သုံးသပ်ချက်**\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📌 မေးမြန်းချက်: {user_query}\n\n"
-            f"⚠️ ဒေတာဘေ့စ်တွင် {' / '.join(dates)} အတွက် သက်ဆိုင်ရာမှတ်တမ်း မတွေ့ရှိပါ။\n"
+            f"⚠️ ဒေတာဘေ့စ်တွင် {' / '.join(dates)} အတွက် သက်ဆိုင်ရာသတင်း မတွေ့ရှိပါ။\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
 
     context_blocks = []
-    for r in retrieved_articles[:12]:
+    for r in retrieved_articles[:10]:
         context_blocks.append(
             f"• [{r.get('newspaper_name')} | စာမျက်နှာ {r.get('page_no')} | {r.get('issue_date')}]\n"
             f"ခေါင်းစဉ်: {r.get('headline')}\n"
@@ -514,7 +366,7 @@ Dates: {dates}
 DATABASE EVIDENCE:
 {chr(10).join(context_blocks)}
 
-Provide a concise, professional Myanmar summary with newspaper citations.
+Provide a concise, professional Myanmar summary with exact citations (newspaper name, page, date).
 """
     try:
         res = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
@@ -524,46 +376,44 @@ Provide a concise, professional Myanmar summary with newspaper citations.
 
 
 # ============================================================
-# 7. TELEGRAM HANDLERS
+# 5. TELEGRAM COMMAND HANDLERS
 # ============================================================
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome = (
-        "🇲🇲 **Myanmar Intelligent Newsroom AI Bot (v7.0)**\n\n"
-        "• နေ့စဉ်ထုတ် သတင်းစာများမှ **စက်သုံးဆီ၊ ရွှေ၊ ငွေလဲနှုန်းနှင့် ကုန်ဈေးနှုန်းများကို ၁၀၀% တိကျစွာ** စိစစ်တွက်ချက်ပေးပါသည်\n"
-        "• မနေ့ကနှင့် ဒီနေ့ ဈေးနှုန်းကွာခြားချက် (တက်/ကျ) များကို သင်္ချာနည်းကျ အတိအကျ ပြသပေးပါသည်\n\n"
-        "📌 **စမ်းသပ် မေးမြန်းနိုင်သော ဥပမာများ:**\n"
-        "• `မနေ့က စက်သုံးဆီဈေးနှုန်းအခြေအနေနဲ့ ဒီနေ့ စက်သုံးဆီအခြေအနေ နှိင်းယှဉ်ပြပါ`\n"
-        "• `ဒီနေ့ ရွှေရည်ညွှန်းဈေး ဘယ်လောက်လဲ`\n"
-        "• `/compare <ခေါင်းစဉ်>` (သတင်းဌာနစုံ Cross-Check ပြုလုပ်ရန်)"
-    )
-    await safe_send_or_edit(None, welcome, is_edit=False, update_context=update)
+    welcome = get_greeting_response()
+    await update.message.reply_text(welcome, parse_mode="Markdown")
+
+
+async def sources_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sources command: စနစ်ထဲရှိ မီဒီယာစာရင်း ပြသခြင်း"""
+    text = get_sources_report()
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def status_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/status command: ဒေတာဘေ့စ် Status ပြသခြင်း"""
+    supabase = get_supabase_client()
+    text = get_system_status(supabase)
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def compare_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/compare command: သတင်းဌာနစုံ Cross-Source စိစစ်ခြင်း"""
     if not context.args:
-        await safe_send_or_edit(
-            None,
+        await update.message.reply_text(
             "📋 **/compare အသုံးပြုနည်း:** `/compare <ခေါင်းစဉ်>`\nဥပမာ: `/compare စစ်ရေး`",
-            is_edit=False,
-            update_context=update,
+            parse_mode="Markdown",
         )
         return
 
     if not run_cross_source_comparison:
-        await safe_send_or_edit(
-            None,
-            "⚠️ Cross Source Verifier Module ချိတ်ဆက်မထားပါ။",
-            is_edit=False,
-            update_context=update,
-        )
+        await update.message.reply_text("⚠️ Cross Source Verifier Module မရှိပါ။", parse_mode="Markdown")
         return
 
     topic = " ".join(context.args).strip()
     status_msg = await safe_send_or_edit(
         None,
         f"🔍 **Cross-Source Fact-Check စတင်နေပါသည်...**\nခေါင်းစဉ်: _{topic}_",
-        is_edit=False,
         update_context=update,
     )
 
@@ -578,12 +428,32 @@ async def compare_command_handler(update: Update, context: ContextTypes.DEFAULT_
         await safe_send_or_edit(status_msg, f"⚠️ အမှားဖြစ်ပေါ်ခဲ့သည်: `{e}`", is_edit=True)
 
 
+# ============================================================
+# 6. MAIN MESSAGE HANDLER (MULTI-ROUTE INTELLIGENCE)
+# ============================================================
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     user_query = update.message.text.strip()
     if not user_query:
+        return
+
+    # ----------------------------------------------------
+    # ROUTE 1: GREETING & CASUAL FILTER (နှုတ်ဆက်စကား စစ်ဆေးခြင်း)
+    # ----------------------------------------------------
+    if is_greeting_or_casual(user_query):
+        welcome_reply = get_greeting_response()
+        await update.message.reply_text(welcome_reply, parse_mode="Markdown")
+        return
+
+    # ----------------------------------------------------
+    # ROUTE 2: SYSTEM META & SOURCES QUERIES ("သတင်းဌာန ဘယ်နှစ်ခုလဲ")
+    # ----------------------------------------------------
+    if is_system_meta_query(user_query):
+        report = get_sources_report()
+        await update.message.reply_text(report, parse_mode="Markdown")
         return
 
     today_str, yesterday_str = get_myanmar_dates()
@@ -596,44 +466,31 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         target_dates = [today_str]
 
-    status_msg = await safe_send_or_edit(
-        None,
-        "🔍 သတင်းစာ ဒေတာဘေ့စ်တွင် တိကျသော အချက်အလက်များ စိစစ်နေပါသည်...",
-        is_edit=False,
-        update_context=update,
-    )
+    status_msg = await safe_send_or_edit(None, "🔍 သတင်းစာ ဒေတာဘေ့စ်တွင် စိစစ်ရှာဖွေနေပါသည်...", update_context=update)
 
     try:
-        # ============================================================
-        # PATH 1: DEDICATED PRECISION NUMERIC ROUTE
-        # ============================================================
+        supabase = get_supabase_client()
+        genai_client = get_genai_client()
+
+        # ----------------------------------------------------
+        # ROUTE 3: PRECISION NUMERIC & COMMODITY ROUTE (စက်သုံးဆီ / ရွှေဈေး)
+        # ----------------------------------------------------
         if is_numeric_or_price_query(user_query):
             comm_key = detect_commodity_context(user_query)
-            logger.info("🎯 Numeric route activated. Detected commodity: '%s'", comm_key)
+            logger.info("🎯 Numeric Route: '%s'", comm_key)
 
-            # 1. Query structured table `newspaper_numbers`
-            numeric_records = await asyncio.to_thread(
-                query_newspaper_numbers, supabase, comm_key, target_dates
-            )
+            numeric_records = await asyncio.to_thread(query_newspaper_numbers, supabase, comm_key, target_dates)
 
-            # 2. If not found in `newspaper_numbers`, auto-extract from `articles` and cache!
+            # Auto-cache fallback if empty
             if not numeric_records and genai_client:
-                logger.info("ℹ️ Numbers not found in cache. Extracting from articles...")
-                articles = await asyncio.to_thread(
-                    execute_articles_search, supabase, [comm_key or "ရည်ညွှန်း"], target_dates
-                )
+                logger.info("ℹ️ Numbers missing in cache. Extracting from articles...")
+                articles = await asyncio.to_thread(execute_articles_search, supabase, [comm_key or "ရည်ညွှန်း"], target_dates)
                 numeric_records = await asyncio.to_thread(
-                    extract_and_cache_missing_numbers,
-                    genai_client,
-                    supabase,
-                    articles,
-                    target_dates,
-                    comm_key,
+                    extract_and_cache_missing_numbers, genai_client, supabase, articles, target_dates, comm_key
                 )
 
-            # 3. If numeric records exist, generate 100% mathematically exact report
             if numeric_records:
-                report = build_precision_numeric_report(
+                report = format_numeric_dashboard(
                     data_rows=numeric_records,
                     dates=target_dates,
                     user_query=user_query,
@@ -645,33 +502,33 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await safe_send_or_edit(None, ch, is_edit=False, update_context=update)
                 return
 
-        # ============================================================
-        # PATH 2: GENERAL NARRATIVE NEWS ROUTE
-        # ============================================================
+        # ----------------------------------------------------
+        # ROUTE 4: GENERAL NEWSPAPER ARTICLE SEARCH
+        # ----------------------------------------------------
         search_terms = [w for w in user_query.split() if len(w) >= 2][:5]
-        articles = await asyncio.to_thread(
-            execute_articles_search, supabase, search_terms, target_dates
-        )
-        final_answer = await asyncio.to_thread(
-            generate_general_editorial_response,
-            genai_client,
-            user_query,
-            articles,
-            target_dates,
-        )
+        articles = await asyncio.to_thread(execute_articles_search, supabase, search_terms, target_dates)
 
-        chunks = split_message_text(final_answer)
-        await safe_send_or_edit(status_msg, chunks[0], is_edit=True)
-        for ch in chunks[1:]:
-            await safe_send_or_edit(None, ch, is_edit=False, update_context=update)
+        if articles:
+            final_answer = await asyncio.to_thread(
+                generate_general_editorial_response, genai_client, user_query, articles, target_dates
+            )
+            chunks = split_message_text(final_answer)
+            await safe_send_or_edit(status_msg, chunks[0], is_edit=True)
+            for ch in chunks[1:]:
+                await safe_send_or_edit(None, ch, is_edit=False, update_context=update)
+            return
+
+        # ----------------------------------------------------
+        # ROUTE 5: GENERAL AI CONVERSATION (သတင်းစာထဲ မပါသော အထွေထွေမေးခွန်းများ)
+        # ----------------------------------------------------
+        general_answer = await asyncio.to_thread(
+            handle_general_ai_conversation, user_query, genai_client, GEMINI_MODEL
+        )
+        await safe_send_or_edit(status_msg, general_answer, is_edit=True)
 
     except Exception as e:
         logger.error("❌ Execution error: %s", e, exc_info=True)
-        await safe_send_or_edit(
-            status_msg,
-            f"⚠️ အချက်အလက်ထုတ်ယူရာတွင် ချို့ယွင်းချက်ဖြစ်ပေါ်ခဲ့သည်: `{e}`",
-            is_edit=True,
-        )
+        await safe_send_or_edit(status_msg, f"⚠️ အချက်အလက်ထုတ်ယူရာတွင် ချို့ယွင်းချက်ဖြစ်ပေါ်ခဲ့သည်: `{e}`", is_edit=True)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -682,11 +539,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# 8. MAIN ENTRYPOINT
+# 7. MAIN ENTRYPOINT
 # ============================================================
 
 def main():
-    print("🤖 Myanmar Intelligent Newsroom Bot (v7.0 Precision Edition) is starting...")
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("❌ TELEGRAM_BOT_TOKEN မရှိပါ။ .env ကို စစ်ဆေးပါ။")
+
+    print("🤖 Myanmar Intelligent Newsroom Bot (v7.3 Stable) is starting...")
     print(f"🕘 Timezone: Asia/Yangon")
     print(f"📰 Monitored Papers: {', '.join(NEWSPAPERS)}")
 
@@ -699,9 +559,14 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(t_request).build()
 
+    # Command Handlers
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", start_handler))
+    app.add_handler(CommandHandler("sources", sources_command_handler))
+    app.add_handler(CommandHandler("status", status_command_handler))
     app.add_handler(CommandHandler("compare", compare_command_handler))
+
+    # Message Handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(error_handler)
 
