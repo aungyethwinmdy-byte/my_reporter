@@ -19,6 +19,9 @@ from supabase import create_client, Client
 from google import genai
 from google.genai import types
 
+import gemini_config
+from gemini_config import generate_content_with_fallback
+
 env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(dotenv_path=env_path)
 
@@ -43,7 +46,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 STATE_MEDIA_SOURCES = ["မြန်မာ့အလင်း", "ကြေးမုံ"]
 SEARCH_WINDOW_DAYS = int(os.getenv("SEARCH_WINDOW_DAYS", 14))
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Shared model defaults + fallback chain (GEMINI_MODEL / GEMINI_FALLBACK_MODELS).
+GEMINI_MODEL = gemini_config.GEMINI_MODEL
+GEMINI_MODELS = gemini_config.GEMINI_MODELS
 
 state_db: Optional[Client] = None
 independent_db: Optional[Client] = None
@@ -69,7 +74,7 @@ except Exception as e:
 try:
     if GEMINI_API_KEY:
         genai_client = genai.Client(api_key=GEMINI_API_KEY)
-        logger.info(f"✅ Gemini client initialized (Model: {GEMINI_MODEL})")
+        logger.info(f"✅ Gemini client initialized (Models: {gemini_config.describe_models()})")
 except Exception as e:
     logger.error(f"❌ Gemini init failed: {e}")
 
@@ -93,14 +98,11 @@ def safe_json_extract(text: str) -> List[str]:
 
 
 def generate_with_retry(prompt: str, config: types.GenerateContentConfig, max_retries: int = 3) -> str:
+    """Model fallback (primary -> fallbacks) per attempt, then exponential retry on 503."""
     delay = 2
     for attempt in range(max_retries):
         try:
-            response = genai_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=config
-            )
+            response = generate_content_with_fallback(genai_client, contents=prompt, config=config)
             return response.text.strip()
         except Exception as e:
             err_str = str(e)
@@ -362,7 +364,7 @@ def run_cross_source_comparison(topic: str) -> Dict[str, Any]:
         f"• Independent Articles: {len(independent_articles)}\n"
         f"• Search Keywords: {', '.join(keywords)}\n"
         f"• Search Window: {SEARCH_WINDOW_DAYS} days\n"
-        f"• Model: {GEMINI_MODEL}"
+        f"• Model: {GEMINI_MODEL} (fallback: {', '.join(GEMINI_MODELS[1:]) or 'none'})"
     )
 
     return {

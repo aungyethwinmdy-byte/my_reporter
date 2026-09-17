@@ -8,9 +8,13 @@ Extracts all prices, commodity rates, statistics into `newspaper_numbers`
 import json
 import logging
 import re
+from typing import Optional
+
 from google import genai
 from google.genai import types
 from supabase import Client
+
+from gemini_config import generate_content_with_fallback, resolve_models
 
 logger = logging.getLogger("NumericExtractor")
 BURMESE_DIGIT_MAP = str.maketrans("၀၁၂၃၄၅၆၇၈၉", "0123456789")
@@ -30,9 +34,13 @@ def extract_numbers_from_article(
     publication_date: str,
     section: str,
     genai_client: genai.Client,
-    model_name: str = "gemini-2.5-flash",
+    model_name: Optional[str] = None,
 ) -> list[dict]:
-    """သတင်းတစ်ပုဒ်ချင်းစီမှ ဈေးနှုန်းနှင့် ကိန်းဂဏန်းများကို Schema ဖြင့် တိကျစွာ ထုတ်ယူခြင်း"""
+    """သတင်းတစ်ပုဒ်ချင်းစီမှ ဈေးနှုန်းနှင့် ကိန်းဂဏန်းများကို Schema ဖြင့် တိကျစွာ ထုတ်ယူခြင်း
+
+    ``model_name`` မပေးပါက GEMINI_MODEL (default: gemini-3.5-flash-lite) ကို သုံးပြီး
+    fail ပါက GEMINI_FALLBACK_MODELS အတိုင်း ဆက်စမ်းသည်။
+    """
     if not genai_client or not article_text or len(article_text.strip()) < 10:
         return []
 
@@ -63,15 +71,16 @@ Rules:
 """
 
     try:
-        response = genai_client.models.generate_content(
-            model=model_name,
+        data = generate_content_with_fallback(
+            genai_client,
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.0,
                 response_mime_type="application/json",
             ),
+            models=resolve_models(model_name),
+            parse=json.loads,
         )
-        data = json.loads(response.text)
         return data if isinstance(data, list) else []
     except Exception as e:
         logger.warning("Numeric extraction error: %s", e)

@@ -64,10 +64,16 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
+          # Model defaults live in gemini_config.py (primary: gemini-3.5-flash-lite,
+          # fallbacks: gemini-3.6-flash, gemini-flash-latest). Blank values are
+          # ignored there, so these only need to be set to override.
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          GEMINI_FALLBACK_MODELS: ${{ vars.GEMINI_FALLBACK_MODELS }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python main.py
+        run: |
+          echo "GEMINI_MODELS=$(python -c 'import gemini_config; print(gemini_config.describe_models())')" >> "$GITHUB_ENV"
+          python main.py
 
       - name: Ingest independent media (BBC / Irrawaddy / RFA)
         # External feeds can be rate-limited or blocked; never fail the whole run.
@@ -96,5 +102,5 @@ jobs:
           echo "- Status: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Scheduled timezone: Asia/Yangon" >> "$GITHUB_STEP_SUMMARY"
           echo "- Schedule frequency: Hourly (6:30 AM - 2:30 PM MMT)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Gemini Model: ${{ secrets.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Gemini Models (primary -> fallbacks): ${GEMINI_MODELS:-see gemini_config.py}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Run time (UTC): $(date -u)" >> "$GITHUB_STEP_SUMMARY"
