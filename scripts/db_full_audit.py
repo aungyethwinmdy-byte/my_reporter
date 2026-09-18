@@ -1,3 +1,11 @@
+"""Read-only diagnostic: full database audit & status report.
+
+Run from the repository root so ``load_dotenv()`` can find ``.env``:
+
+    python scripts/db_full_audit.py
+
+Performs no writes — safe to run against production.
+"""
 import os
 from datetime import datetime
 import pytz
@@ -90,7 +98,7 @@ try:
     earliest_date = earliest_res.data[0]['issue_date'] if earliest_res.data else "N/A"
     latest_date = latest_res.data[0]['issue_date'] if latest_res.data else "N/A"
 
-    print(f"📅 [သတင်းစာ ရက်စွဲ အကွာအဝေး Coverage]")
+    print("📅 [သတင်းစာ ရက်စွဲ အကွာအဝေး Coverage]")
     print(f"  • အစောဆုံး ရရှိနိုင်သည့် ရက်စွဲ : {earliest_date}")
     print(f"  • နောက်ဆုံး ရရှိထားသည့် ရက်စွဲ : {latest_date}")
 

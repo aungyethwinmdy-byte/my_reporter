@@ -46,6 +46,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Install lint tooling
+        run: pip install ruff
+
+      - name: Lint (undefined names / unused imports)
+        # F821 (undefined name) would have caught the /compare NameError at
+        # review time; keep it a hard gate so it cannot come back.
+        run: ruff check . --select F,E9
+
       - name: Run automated tests
         run: python -m unittest discover -s tests -v
 

@@ -13,6 +13,8 @@ import re
 import json
 import logging
 
+from env_config import get_gemini_api_key, get_supabase_credentials
+
 # Environment Variables Loading
 try:
     from dotenv import load_dotenv
@@ -50,15 +52,10 @@ logging.basicConfig(
 logger = logging.getLogger("IngestionPipeline")
 
 # Configuration
-# NOTE: env only — a hardcoded fallback silently points ingestion at the
-# wrong Supabase project.
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = (
-    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    or os.environ.get("SUPABASE_KEY")
-    or os.environ.get("SUPABASE_ANON_KEY")
-)
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# NOTE: env only — hardcoded fallbacks silently point ingestion at the wrong
+# Supabase project. Resolution lives in env_config so all five callers agree.
+SUPABASE_URL, SUPABASE_KEY = get_supabase_credentials()
+GEMINI_API_KEY = get_gemini_api_key()
 
 # Initialize Supabase
 supabase: Client = None

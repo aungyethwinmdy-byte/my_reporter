@@ -1,10 +1,10 @@
-import os
 import json
+
+from env_config import get_supabase_credentials
 
 # Supabase Credentials — env only; a hardcoded fallback can silently point the
 # MCP server at the wrong project.
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_URL, SUPABASE_KEY = get_supabase_credentials()
 
 
 def get_supabase_client():
@@ -73,7 +73,8 @@ def create_server():
 
 if __name__ == "__main__":
     # Run as SSE server for Gemini Spark
-    import uvicorn
+    from env_config import get_int
 
-    port = int(os.environ.get("PORT", 8000))
+    # A malformed PORT (e.g. "8000/tcp") must not crash the server at startup.
+    port = get_int("PORT", 8000, minimum=1, maximum=65535)
     create_server().run(transport="sse", host="0.0.0.0", port=port)

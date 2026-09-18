@@ -26,6 +26,7 @@ import requests
 import feedparser
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from env_config import get_supabase_credentials
 from supabase import create_client, Client
 
 env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -38,12 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("NewsIngestor")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = (
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    or os.getenv("SUPABASE_KEY")
-    or os.getenv("SUPABASE_ANON_KEY")
-)
+SUPABASE_URL, SUPABASE_KEY = get_supabase_credentials()
 INDEPENDENT_TABLE_NAME = os.getenv("INDEPENDENT_TABLE_NAME", "independent_articles")
 
 # NOTE: the client is created lazily (see get_supabase_client) so that importing

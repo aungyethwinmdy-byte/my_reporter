@@ -32,6 +32,6 @@ env/
 *.log
 .DS_Store
 Thumbs.db
-.env
-__pycache__/
-*.pyc
+
+# Local AI assistant workspace (project notes, caches — never shared)
+.workbuddy-ai/
