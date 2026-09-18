@@ -5,10 +5,11 @@ MYANMAR INTELLIGENT NEWSROOM BOT (v7.3 Stable Edition)
   1. Greeting / casual filter
   2. System meta & sources queries (/sources, /status)
   3. Precision numeric & commodity engine (cards dashboard)
-  4. General newspaper article search & editorial
+  4. General newspaper article search & daily briefing
   5. General AI conversation fallback
 - Lazy client initialization (safe imports in CI/tests)
 - Shared Gemini models & fallback chain from gemini_config
+- Balanced sampling across Myanmar Alinn & Kyemon
 ================================================================
 """
 
@@ -30,6 +31,7 @@ except ImportError:
     pass
 
 from supabase import create_client, Client
+from env_config import get_gemini_api_key, get_supabase_credentials
 from google import genai
 from google.genai import types
 
@@ -38,7 +40,7 @@ from gemini_config import generate_content_with_fallback
 
 from telegram import Update
 from telegram.request import HTTPXRequest
-from telegram.error import TimedOut, NetworkError
+from telegram.error import BadRequest, TimedOut, NetworkError
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -73,6 +75,7 @@ __all__ = [
     "detect_commodity_context",
     "execute_articles_search",
     "get_myanmar_dates",
+    "is_general_daily_news_query",
     "is_numeric_or_price_query",
     "normalize_digits",
     "split_message_text",
@@ -94,14 +97,9 @@ except ImportError:
 # ============================================================
 
 MYANMAR_TZ = ZoneInfo("Asia/Yangon")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = (
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    or os.getenv("SUPABASE_KEY")
-    or os.getenv("SUPABASE_ANON_KEY")
-)
+SUPABASE_URL, SUPABASE_KEY = get_supabase_credentials()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+GEMINI_API_KEY = get_gemini_api_key()
 
 # Shared model defaults + fallback chain (GEMINI_MODEL / GEMINI_FALLBACK_MODELS)
 GEMINI_MODEL = gemini_config.GEMINI_MODEL
@@ -159,21 +157,16 @@ async def safe_send_or_edit(
     update_context=None,
 ):
     """Send or edit telegram messages with retry and plain text fallback."""
-    clean_text = text.replace("*", "").replace("_", "").replace("`", "")
-    for attempt in range(3):
+    clean_text = re.sub(r"[*_`\[\]]", "", text)[:4000]
+    for attempt in range(2):
         try:
             if is_edit and message_obj:
-                return await message_obj.edit_text(text, parse_mode="Markdown")
+                return await message_obj.edit_text(text[:4000], parse_mode="Markdown")
             elif update_context and update_context.message:
-                return await update_context.message.reply_text(text, parse_mode="Markdown")
+                return await update_context.message.reply_text(text[:4000], parse_mode="Markdown")
             return None
-        except (TimedOut, NetworkError) as e:
-            await asyncio.sleep(1)
-            if attempt < 2:
-                continue
-            logger.warning("⚠️ Network timeout during delivery: %s", e)
-        except Exception as e:
-            logger.warning("Markdown parse failed, fallback to plain text: %s", e)
+        except BadRequest as e:
+            logger.warning("Markdown parse failed (%s), fallback to plain text", e)
             try:
                 if is_edit and message_obj:
                     return await message_obj.edit_text(clean_text)
@@ -181,6 +174,14 @@ async def safe_send_or_edit(
                     return await update_context.message.reply_text(clean_text)
             except Exception as final_e:
                 logger.error("Failed to send message completely: %s", final_e)
+            return None
+        except (TimedOut, NetworkError) as e:
+            await asyncio.sleep(1)
+            if attempt < 1:
+                continue
+            logger.warning("⚠️ Network timeout during delivery: %s", e)
+        except Exception as e:
+            logger.error("Unexpected delivery error: %s", e)
             return None
     return None
 
@@ -217,10 +218,10 @@ def split_message_text(text: str, max_length: int = 3500) -> list[str]:
 def is_numeric_or_price_query(query: str) -> bool:
     """စက်သုံးဆီ၊ ရွှေ၊ ငွေလဲနှုန်း စသည့် ကိန်းဂဏန်းသီးသန့် မေးမြန်းချက် ဟုတ်/မဟုတ် စစ်ဆေးခြင်း"""
     keywords = [
-        "စက်သုံးဆီ", "ဓာတ်ဆီ", "ဒီဇယ်", "octane", "diesel",
-        "ရွှေ", "ရွှေဈေး", "ဒေါ်လာ", "ငွေလဲနှုန်း", "usd",
-        "ဈေး", "ဈေးနှုန်း", "ပေါက်ဈေး", "ရည်ညွှန်း", "ကျပ်",
-        "မနေ့က", "ဒီနေ့", "နှိုင်းယှဉ်", "တက်", "ကျ", "အပြောင်းအလဲ",
+        "စက်သုံးဆီ", "ဓာတ်ဆီ", "ဒီဇယ်", "ဒဇယ်", "octane", "diesel",
+        "ရွှေ", "ရွှေဈေး", "ဒေါ်လာ", "ငွေလဲနှုန်း", "ငွေလဲလှယ်နှုန်း", "usd",
+        "ပေါက်ဈေး", "ရည်ညွှန်းဈေး", "လက်ကားဈေး", "လက်လီဈေး",
+        "စပါးဈေး", "ဆန်ဈေး", "ပဲဈေး", "နှိုင်းယှဉ်",
     ]
     low = query.lower()
     return any(k in low for k in keywords)
@@ -240,6 +241,18 @@ def detect_commodity_context(query: str) -> str:
     if any(k in low for k in ["ပဲ", "မတ်ပဲ", "ပဲတီစိမ်း"]):
         return "ပဲ"
     return ""
+
+
+def is_general_daily_news_query(query: str) -> bool:
+    """ယနေ့ထုတ် သတင်းစာများ၏ မျက်နှာဖုံးနှင့် အဓိကသတင်းများ အနှစ်ချုပ် မေးမြန်းချက် ဟုတ်/မဟုတ် စစ်ဆေးခြင်း"""
+    low = query.lower()
+    triggers = [
+        "ဒီနေ့အတွက် သတင်း", "ဒီနေ့ သတင်း", "ယနေ့ သတင်း", "ယနေ့အတွက် သတင်း",
+        "ဒီနေ့ထုတ်", "သတင်းတွေတင်ပြ", "သတင်းများတင်ပြ", "သတင်းအကျဉ်း", "သတင်းအနှစ်ချုပ်",
+        "မျက်နှာဖုံး", "မျက်နှာဖုံးသတင်း", "headlines", "daily news", "daily briefing",
+        "သတင်းဘာတွေပါလဲ", "သတင်းတွေ ဘာပါလဲ", "သတင်းအခြေအနေ", "သတင်းထူး"
+    ]
+    return any(t in low for t in triggers)
 
 
 def query_newspaper_numbers(
@@ -358,43 +371,56 @@ If no clear prices/numbers are found, return [].
 
 
 # ============================================================
-# 5. GENERAL ARTICLE SEARCH (STANDARD ENGINE)
+# 5. GENERAL ARTICLE SEARCH (BALANCED MULTI-PAPER ENGINE)
 # ============================================================
 
 def execute_articles_search(
     supabase_client: Client,
     search_terms: list[str],
     dates: list[str],
+    is_general_digest: bool = False,
 ) -> list[dict]:
-    """General text search across `articles` view (Page 2 first)."""
+    """သတင်းစာ ၂ စောင်လုံး (မြန်မာ့အလင်း + ကြေးမုံ) မျှတစွာ ပါဝင်စေသော Search Function"""
     if not supabase_client:
         return []
     all_rows = []
     seen = set()
+    target_pages = [1, 2] if is_general_digest else [2]
 
     for dt in dates:
         for paper in NEWSPAPERS:
-            # Always get Page 2 first
-            try:
-                p2 = (
-                    supabase_client.from_("articles")
-                    .select("article_id, newspaper_name, issue_date, page_no, headline, body_text")
-                    .eq("issue_date", dt)
-                    .ilike("newspaper_name", f"%{paper}%")
-                    .eq("page_no", 2)
-                    .limit(20)
-                    .execute()
-                )
-                for r in p2.data or []:
+            paper_articles = []
+            for pg in target_pages:
+                p_res = None
+                for attempt in range(2):
+                    try:
+                        p_res = (
+                            supabase_client.from_("articles")
+                            .select("article_id, newspaper_name, issue_date, page_no, headline, body_text")
+                            .eq("issue_date", dt)
+                            .ilike("newspaper_name", f"%{paper}%")
+                            .eq("page_no", pg)
+                            .limit(8)
+                            .execute()
+                        )
+                        break
+                    except Exception as e:
+                        if attempt == 0:
+                            time.sleep(0.5)
+                            continue
+                        logger.warning("Page query error for %s (page %s): %s", paper, pg, e)
+
+                for r in (p_res.data if p_res else []) or []:
                     aid = r.get("article_id")
-                    if aid not in seen:
+                    if aid and aid not in seen:
                         seen.add(aid)
-                        all_rows.append(r)
-            except Exception as e:
-                logger.warning("Page 2 query error: %s", e)
+                        paper_articles.append(r)
+
+            # သတင်းစာ တစ်စောင်စီမှ ထိပ်တန်းသတင်းများကို ဦးစားပေး ထည့်သွင်းခြင်း
+            all_rows.extend(paper_articles[:7])
 
             # Keyword query
-            if search_terms:
+            if search_terms and not is_general_digest:
                 clean_kws = [re.sub(r"[,;'\"()%]", "", kw).strip() for kw in search_terms[:5]]
                 clean_kws = [k for k in clean_kws if k]
                 if clean_kws:
@@ -402,23 +428,30 @@ def execute_articles_search(
                         f"headline.ilike.%{kw}%,body_text.ilike.%{kw}%"
                         for kw in clean_kws
                     ]
-                    try:
-                        res = (
-                            supabase_client.from_("articles")
-                            .select("article_id, newspaper_name, issue_date, page_no, headline, body_text")
-                            .eq("issue_date", dt)
-                            .ilike("newspaper_name", f"%{paper}%")
-                            .or_(",".join(or_clauses))
-                            .limit(10)
-                            .execute()
-                        )
-                        for r in res.data or []:
-                            aid = r.get("article_id")
-                            if aid not in seen:
-                                seen.add(aid)
-                                all_rows.append(r)
-                    except Exception as e:
-                        logger.warning("Keyword query error: %s", e)
+                    res = None
+                    for attempt in range(2):
+                        try:
+                            res = (
+                                supabase_client.from_("articles")
+                                .select("article_id, newspaper_name, issue_date, page_no, headline, body_text")
+                                .eq("issue_date", dt)
+                                .ilike("newspaper_name", f"%{paper}%")
+                                .or_(",".join(or_clauses))
+                                .limit(6)
+                                .execute()
+                            )
+                            break
+                        except Exception as e:
+                            if attempt == 0:
+                                time.sleep(0.5)
+                                continue
+                            logger.warning("Keyword query error for %s: %s", paper, e)
+
+                    for r in (res.data if res else []) or []:
+                        aid = r.get("article_id")
+                        if aid and aid not in seen:
+                            seen.add(aid)
+                            all_rows.append(r)
 
     return all_rows
 
@@ -429,7 +462,7 @@ def generate_general_editorial_response(
     retrieved_articles: list[dict],
     dates: list[str],
 ) -> str:
-    """Fallback editorial response for non-numeric narrative queries."""
+    """Fallback editorial response for narrative queries and daily briefings."""
     if not retrieved_articles:
         return (
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -441,16 +474,23 @@ def generate_general_editorial_response(
         )
 
     context_blocks = []
-    for r in retrieved_articles[:12]:
+    for r in retrieved_articles[:14]:
+        p_name = r.get("newspaper_name") or "နိုင်ငံပိုင်သတင်းစာ"
+        p_page = r.get("page_no") or "-"
+        p_date = r.get("issue_date") or ""
+        h_line = r.get("headline") or ""
+        b_text = str(r.get("body_text") or "")[:1200]
         context_blocks.append(
-            f"• [{r.get('newspaper_name')} | စာမျက်နှာ {r.get('page_no')} | {r.get('issue_date')}]\n"
-            f"ခေါင်းစဉ်: {r.get('headline')}\n"
-            f"အကြောင်းအရာ: {str(r.get('body_text'))[:1500]}"
+            f"• [{p_name} | {p_date} | စာမျက်နှာ {p_page}]\n"
+            f"ခေါင်းစဉ်: {h_line}\n"
+            f"အကြောင်းအရာ: {b_text}"
         )
 
     prompt = f"""
 You are the Executive Editor of Myanmar Intelligent Newsroom.
-Answer the user's question using ONLY the provided newspaper evidence.
+Provide a clear, objective, and well-structured Myanmar summary of the daily news or answering the user question.
+Strictly cite the newspaper and page number (e.g. "ကိုးကားချက် - မြန်မာ့အလင်း | စာမျက်နှာ 1", "ကိုးကားချက် - ကြေးမုံ | စာမျက်နှာ 2").
+Ensure representation of both newspapers if available in the evidence.
 Do not invent facts, figures, or dates.
 
 User Question: {user_query}
@@ -459,7 +499,8 @@ Dates: {dates}
 DATABASE EVIDENCE:
 {chr(10).join(context_blocks)}
 
-Provide a concise, professional Myanmar summary with newspaper citations.
+Response format:
+Professional Myanmar journalistic summary with clear bullet points, titles, and citations.
 """
     try:
         res = generate_content_with_fallback(client, contents=prompt)
@@ -480,6 +521,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• မနေ့ကနှင့် ဒီနေ့ ဈေးနှုန်းကွာခြားချက် (တက်/ကျ) များကို သင်္ချာနည်းကျ အတိအကျ ပြသပေးပါသည်\n\n"
         "📌 **စမ်းသပ် မေးမြန်းနိုင်သော ဥပမာများ:**\n"
         "• `မနေ့က စက်သုံးဆီဈေးနှုန်းအခြေအနေနဲ့ ဒီနေ့ စက်သုံးဆီအခြေအနေ နှိုင်းယှဉ်ပြပါ`\n"
+        "• `ဒီနေ့အတွက် သတင်းတွေတင်ပြပေးပါ` (နေ့စဉ် အဓိကသတင်းများ အနှစ်ချုပ်)\n"
         "• `ဒီနေ့ ရွှေရည်ညွှန်းဈေး ဘယ်လောက်လဲ`\n"
         "• `/compare <ခေါင်းစဉ်>` (သတင်းဌာနစုံ Cross-Check ပြုလုပ်ရန်)\n"
         "• `/sources` (စောင့်ကြည့်သော မီဒီယာများ စာရင်း)\n"
@@ -584,8 +626,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ----------------------------------------------------
         # ROUTE 3: PRECISION NUMERIC & COMMODITY ROUTE
         # ----------------------------------------------------
-        if is_numeric_or_price_query(user_query):
-            comm_key = detect_commodity_context(user_query)
+        comm_key = detect_commodity_context(user_query)
+        if is_numeric_or_price_query(user_query) and comm_key:
             logger.info("🎯 Numeric Route: '%s'", comm_key)
 
             numeric_records = await asyncio.to_thread(
@@ -596,7 +638,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not numeric_records and genai_client:
                 logger.info("ℹ️ Numbers missing in cache. Extracting from articles...")
                 articles = await asyncio.to_thread(
-                    execute_articles_search, supabase, [comm_key or "ရည်ညွှန်း"], target_dates
+                    execute_articles_search, supabase, [comm_key or "ရည်ညွှန်း"], target_dates, False
                 )
                 numeric_records = await asyncio.to_thread(
                     extract_and_cache_missing_numbers, genai_client, supabase, articles, target_dates, comm_key
@@ -616,13 +658,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         # ----------------------------------------------------
-        # ROUTE 4: GENERAL NEWSPAPER ARTICLE SEARCH
+        # ROUTE 4: GENERAL NEWSPAPER ARTICLE SEARCH & DAILY BRIEFING
         # ----------------------------------------------------
+        is_digest = is_general_daily_news_query(user_query)
+
         raw_words = [w for w in user_query.split() if len(w) >= 2][:5]
         search_terms = [re.sub(r"[,;'\"()%]", "", w).strip() for w in raw_words]
         search_terms = [w for w in search_terms if w]
 
-        articles = await asyncio.to_thread(execute_articles_search, supabase, search_terms, target_dates)
+        articles = await asyncio.to_thread(
+            execute_articles_search, supabase, search_terms, target_dates, is_digest
+        )
 
         if articles:
             final_answer = await asyncio.to_thread(
