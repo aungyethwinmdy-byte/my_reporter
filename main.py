@@ -1,7 +1,6 @@
 import logging
 import os
 import sqlite3
-import sys
 import argparse
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -26,12 +25,9 @@ from notifications import (
     build_success_notification,
 )
 from utils import (
-    absolute_url,
     download_pdf_to_disk,
     find_moi_paper_universal,
     get_mdn_backup_papers,
-    is_valid_pdf,
-    MOI_SOURCES,
 )
 
 from ingest_engine import process_and_ingest_pdf
@@ -226,7 +222,16 @@ def process_newspaper(service, folder_id, name, prefix, file_prefix, base_url, d
                     status="uploaded", drive_url=drive_link,
                 )
             except Exception as drive_err:
+                # Record the failure. Previously this branch only logged, so the
+                # row stayed absent from download_history: `is_uploaded` returned
+                # False forever, the Drive folder silently missed the issue, and
+                # the run still reported success to Telegram.
                 logger.error("Drive upload failed: %s", drive_err)
+                save_history(
+                    newspaper=file_prefix, source=source_name, published_date=published_date,
+                    source_file_id=file_id, source_url=file_url, filename=filename,
+                    status="failed", error=f"Drive upload failed: {drive_err}",
+                )
         else:
             save_history(
                 newspaper=file_prefix, source=source_name, published_date=published_date,
@@ -235,11 +240,24 @@ def process_newspaper(service, folder_id, name, prefix, file_prefix, base_url, d
             )
 
         # Direct DB Ingestion
-        ingest_ok = process_and_ingest_pdf(local_path, name, published_date)
+        # The PDF is already safely uploaded at this point, so an ingestion
+        # failure must not abort the run: without this guard an exception here
+        # propagated out of process_newspaper() and the *second* newspaper was
+        # never fetched at all.
+        try:
+            ingest_ok = process_and_ingest_pdf(local_path, name, published_date)
+        except Exception as ingest_err:
+            logger.exception("Supabase ingestion raised for %s", filename)
+            ingest_ok = False
+            ingest_error = ingest_err
+        else:
+            ingest_error = None
+
         if ingest_ok:
             logger.info("Supabase direct ingestion success for %s", filename)
         else:
-            logger.warning("Supabase direct ingestion skipped or failed for %s", filename)
+            detail = f": {ingest_error}" if ingest_error else ""
+            logger.warning("Supabase direct ingestion skipped or failed for %s%s", filename, detail)
 
         # NOTE: Telegram inline buttons require a real http(s) URL. Passing the
         # literal "Direct DB Ingested" made sendMessage fail with HTTP 400,

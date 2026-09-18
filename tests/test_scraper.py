@@ -33,6 +33,136 @@ class FakeFetcher:
         return self.good_html if self.good_pred(url) else None
 
 
+class TlsVerificationTests(unittest.TestCase):
+    """TLS verification must stay ON unless explicitly opted out.
+
+    The scraper used to call verify=False on every request, silently accepting
+    forged certificates for the very PDFs that get ingested into the newsroom DB.
+    """
+
+    def test_verification_is_enabled_by_default(self):
+        # Import in a clean env: NEWSROOM_INSECURE_TLS must be unset here.
+        import os
+
+        if "NEWSROOM_INSECURE_TLS" in os.environ:
+            self.skipTest("NEWSROOM_INSECURE_TLS set in this environment")
+        self.assertTrue(
+            utils.VERIFY_TLS,
+            "TLS verification must default to ON (opt out via NEWSROOM_INSECURE_TLS=1)",
+        )
+
+    def test_insecure_flag_parsing(self):
+        """Parsing now lives in env_config.get_bool (shared, never raises)."""
+        from env_config import get_bool
+
+        for raw, expected in (
+            ("1", True),
+            ("true", True),
+            ("YES", True),
+            ("on", True),
+            ("0", False),
+            ("false", False),
+            ("", False),
+            ("   ", False),
+            ("nonsense", False),
+        ):
+            self.assertEqual(
+                get_bool("NEWSROOM_INSECURE_TLS", False, environ={"NEWSROOM_INSECURE_TLS": raw}),
+                expected,
+                f"NEWSROOM_INSECURE_TLS={raw!r}",
+            )
+
+    def test_no_hardcoded_verify_false_in_source(self):
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        offenders = []
+        for path in root.glob("*.py"):
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                if re.search(r"verify\s*=\s*False", line):
+                    offenders.append(f"{path.name}:{lineno}")
+        self.assertEqual(offenders, [], f"TLS verification disabled at: {offenders}")
+
+
+class ProbeIsolationTests(unittest.TestCase):
+    """One failing probe must not discard another probe's valid result.
+
+    Regression: `_probe_for_pdf_links` wrapped `future.result()` in a blanket
+    `except Exception`, so a single transient network error aborted the search
+    and returned None even when a sibling probe had already found the PDF.
+    """
+
+    GOOD_HTML = '<a href="/file-download/download/public/mal-2026-09-15">issue</a>'
+    EXPECTED = "https://www.moi.gov.mm/file-download/download/public/mal-2026-09-15"
+
+    def setUp(self):
+        self._orig = utils._fetch_html
+
+    def tearDown(self):
+        utils._fetch_html = self._orig
+
+    def test_failing_probe_does_not_discard_successful_one(self):
+        def fetcher(url, timeout, params=None):
+            if "broken" in url:
+                raise RuntimeError("transient network error")
+            if "good" in url:
+                return self.GOOD_HTML
+            return None
+
+        utils._fetch_html = fetcher
+        result = utils._probe_for_pdf_links(
+            ["https://www.moi.gov.mm/broken", "https://www.moi.gov.mm/good"],
+            "https://www.moi.gov.mm",
+            timeout=5,
+            deadline=time.monotonic() + 10,
+        )
+        self.assertEqual(
+            result,
+            self.EXPECTED,
+            "a single dead probe must not abort the search",
+        )
+
+    def test_all_probes_failing_returns_none_without_raising(self):
+        def fetcher(url, timeout, params=None):
+            raise RuntimeError("everything is down")
+
+        utils._fetch_html = fetcher
+        result = utils._probe_for_pdf_links(
+            ["https://www.moi.gov.mm/a", "https://www.moi.gov.mm/b"],
+            "https://www.moi.gov.mm",
+            timeout=5,
+            deadline=time.monotonic() + 10,
+        )
+        self.assertIsNone(result)
+
+    def test_mdn_probe_isolation(self):
+        def fetcher(url, timeout, params=None):
+            fmt = params.get("published_date") if params else None
+            if fmt == "15/09/2026":
+                raise RuntimeError("one format blew up")
+            if fmt == "15-09-2026":
+                return '<a href="/newspaper/public/ebooks/download/999">A</a>'
+            return None
+
+        utils._fetch_html = fetcher
+        papers = utils.get_mdn_backup_papers("15", "09", "2026")
+        self.assertEqual(
+            papers,
+            [
+                {
+                    "name": "မြန်မာ့အလင်း",
+                    "file_prefix": "myanmaalinn",
+                    "url": "https://www.mdn.gov.mm/newspaper/public/ebooks/download/999",
+                }
+            ],
+            "a failing date-format probe must not hide another format's hit",
+        )
+
+
 class FindMoiPaperTests(unittest.TestCase):
     def setUp(self):
         self._orig = utils._fetch_html
