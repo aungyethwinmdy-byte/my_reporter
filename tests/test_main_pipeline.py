@@ -162,5 +162,113 @@ class DownloadFailureTests(ProcessNewspaperHarness):
         self.assertEqual(self._rows(), [], "nothing discovered -> nothing to record")
 
 
+class DatabaseConnectionBindingTests(unittest.TestCase):
+    """The history connection must actually reach the module global.
+
+    Every test above patches ``main.DB_CONNECTION`` directly, which is exactly
+    why the real defect went unnoticed: ``__main__`` did a bare
+    ``DB_CONNECTION = sqlite3.connect(...)``, and a bare assignment inside the
+    ``if __name__ == "__main__":`` block binds a *__main__-local*, leaving
+    ``main.DB_CONNECTION`` as ``None``. ``save_history()`` then hit its early
+    ``if DB_CONNECTION is None: return`` on every call:
+
+      * no history row was ever written, so ``is_uploaded()`` always returned
+        False and the same issue was re-downloaded and re-uploaded every day;
+      * ``export_manifest()`` wrote an empty manifest;
+      * the Drive-failure and ingest-failure fixes above could never persist.
+
+    These tests go through the public setter instead of patching, so a
+    regression to a bare assignment is caught.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.db_path = Path(self._tmpdir.name) / "history.sqlite3"
+        main.init_database(self.db_path)
+        # Always leave the module global pointing somewhere harmless.
+        self.addCleanup(main.close_database_connection)
+
+    def test_setter_binds_the_module_global(self):
+        self.assertIsNone(main.DB_CONNECTION, "precondition: starts unbound")
+        connection = main.set_database_connection(sqlite3.connect(self.db_path))
+        self.assertIsNotNone(main.DB_CONNECTION, "module global must be bound")
+        self.assertIs(main.DB_CONNECTION, connection)
+        # close_database_connection (registered in setUp) releases the handle.
+
+    def test_save_history_persists_through_the_module_global(self):
+        connection = main.set_database_connection(sqlite3.connect(self.db_path))
+        main.save_history(
+            newspaper="mal", source="moi", published_date="2026-09-18",
+            source_file_id="mal_18_09_2026", source_url="https://x/issue.pdf",
+            filename="18-Sep-2026_myanmaalinn.pdf", status="uploaded",
+        )
+        # Read back through the SAME connection. Opening a second one and
+        # leaving it open would keep the file locked and break the
+        # TemporaryDirectory cleanup on Windows (WinError 32) — the very
+        # leak this codebase already had to fix once in init_database().
+        rows = connection.execute("SELECT status FROM download_history").fetchall()
+        self.assertEqual(rows, [("uploaded",)], "history row must be persisted")
+
+    def test_save_history_without_a_connection_is_a_silent_noop(self):
+        """The guard is intentional — it must not raise, just do nothing."""
+        self.assertIsNone(main.DB_CONNECTION)
+        main.save_history(
+            newspaper="mal", source="moi", published_date="2026-09-18",
+            source_file_id="x", source_url="u", filename="f.pdf", status="uploaded",
+        )
+
+    def test_close_clears_the_global(self):
+        main.set_database_connection(sqlite3.connect(self.db_path))
+        main.close_database_connection()
+        self.assertIsNone(main.DB_CONNECTION, "must not leave a dangling handle")
+        # Idempotent: a second close is harmless.
+        main.close_database_connection()
+
+    def test_is_uploaded_sees_rows_written_through_the_setter(self):
+        """End-to-end: the duplicate check that guards re-downloading."""
+        main.set_database_connection(sqlite3.connect(self.db_path))
+        file_id = "mal_18_09_2026"
+        self.assertFalse(main.is_uploaded(main.DB_CONNECTION, "mal", file_id))
+        main.save_history(
+            newspaper="mal", source="moi", published_date="2026-09-18",
+            source_file_id=file_id, source_url="https://x/issue.pdf",
+            filename="18-Sep-2026_myanmaalinn.pdf", status="uploaded",
+        )
+        self.assertTrue(
+            main.is_uploaded(main.DB_CONNECTION, "mal", file_id),
+            "a recorded upload must suppress the next day's re-download",
+        )
+
+    def test_main_block_does_not_assign_db_connection_directly(self):
+        """Static guard: the __main__ block must not reintroduce the bare bind.
+
+        A top-level ``DB_CONNECTION = ...`` outside a function shadows the
+        module global for the rest of ``__main__`` only, which is invisible to
+        runtime tests that patch the attribute.
+        """
+        import ast
+        import inspect
+
+        source = inspect.getsource(main)
+        tree = ast.parse(source)
+        offenders = []
+        for node in tree.body:
+            # Only inspect the `if __name__ == "__main__":` block.
+            if not isinstance(node, ast.If):
+                continue
+            for child in ast.walk(node):
+                if isinstance(child, ast.Assign):
+                    for target in child.targets:
+                        if isinstance(target, ast.Name) and target.id == "DB_CONNECTION":
+                            offenders.append(child.lineno)
+        self.assertEqual(
+            offenders,
+            [],
+            f"bare DB_CONNECTION assignment in __main__ at line(s) {offenders}; "
+            "use set_database_connection() instead",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

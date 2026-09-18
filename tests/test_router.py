@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import gemini_config
+import ingest_engine as ie
 from ingest_engine import extract_numbers_into_db, process_and_ingest_pdf
 from system_router import (
     get_greeting_response,
@@ -255,6 +256,55 @@ class IngestAndSearchTests(unittest.TestCase):
             mock_insert.assert_called_once()
             record = mock_insert.call_args[0][0]
             self.assertEqual(record["headline"], "Scanned Vision Article")
+
+
+class VisionFallbackSelectionTests(unittest.TestCase):
+    """A partially-scanned PDF must still OCR the image-only pages.
+
+    ``extract_text_from_pdf`` returns a ``(page_no, text)`` tuple for *every*
+    page, with an empty string for pages that have no text layer. The old
+    dispatch asked only ``any(page has text)`` and then processed the whole
+    document in text mode, so a newspaper where page 1 was digital and page 2
+    was a scan silently dropped page 2 — which is where the fuel and gold price
+    tables usually sit.
+    """
+
+    def _run(self, pages):
+        native_articles = [{"headline": "OCR ခေါင်းစဉ်", "body_text": "body", "page_no": 2}]
+        with patch.object(ie, "extract_page2_tables", return_value=[]), patch.object(
+            ie, "extract_text_from_pdf", return_value=pages
+        ), patch.object(
+            ie, "parse_articles_with_gemini_native_pdf", return_value=native_articles
+        ) as native, patch.object(
+            ie, "parse_articles_with_gemini_text", return_value=[]
+        ), patch.object(
+            ie, "insert_article_to_supabase", return_value=True
+        ), patch.object(
+            ie.os.path, "exists", return_value=True
+        ), patch.object(
+            ie, "supabase", object()
+        ):
+            return ie.process_and_ingest_pdf("x.pdf", "ကြေးမုံ", "2026-09-18"), native
+
+    def test_partially_scanned_pdf_triggers_vision(self):
+        ok, native = self._run([(1, "real text"), (2, ""), (3, "")])
+        self.assertTrue(native.called, "image-only pages must be OCR'd")
+        self.assertTrue(ok)
+
+    def test_fully_scanned_pdf_triggers_vision(self):
+        ok, native = self._run([(1, ""), (2, "")])
+        self.assertTrue(native.called)
+        self.assertTrue(ok)
+
+    def test_no_pages_extracted_triggers_vision(self):
+        ok, native = self._run([])
+        self.assertTrue(native.called)
+        self.assertTrue(ok)
+
+    def test_fully_digital_pdf_skips_vision(self):
+        """No blank pages means no OCR call — that would be wasted tokens."""
+        _, native = self._run([(1, "text"), (2, "text")])
+        self.assertFalse(native.called)
 
 
 if __name__ == "__main__":

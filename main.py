@@ -51,6 +51,32 @@ MMT_TZ = timezone(timedelta(hours=6, minutes=30))
 DB_CONNECTION = None
 
 
+def set_database_connection(connection):
+    """Bind the module-level history connection.
+
+    ``__main__`` cannot assign this directly: a bare ``DB_CONNECTION = ...``
+    inside the ``if __name__ == "__main__":`` block creates a *new local* in
+    the ``__main__`` module, leaving ``main.DB_CONNECTION`` as ``None``. Every
+    ``save_history()`` call then hit its early ``if DB_CONNECTION is None:
+    return`` and silently discarded the row, so ``is_uploaded()`` never saw a
+    history entry and the pipeline re-downloaded and re-uploaded the same issue
+    on every run. Route the assignment through this function instead.
+    """
+    global DB_CONNECTION
+    DB_CONNECTION = connection
+    return DB_CONNECTION
+
+
+def close_database_connection():
+    """Commit and close the history connection if one is bound."""
+    global DB_CONNECTION
+    if DB_CONNECTION is not None:
+        try:
+            DB_CONNECTION.close()
+        finally:
+            DB_CONNECTION = None
+
+
 def resolve_download_date(value):
     if not value:
         return datetime.now(MMT_TZ).date()
@@ -278,7 +304,10 @@ if __name__ == "__main__":
     download_date = resolve_download_date(requested_date_str)
 
     init_database(DATABASE_PATH)
-    DB_CONNECTION = sqlite3.connect(DATABASE_PATH)
+    # Must go through the setter: a bare assignment here would create a
+    # __main__-local and leave main.DB_CONNECTION as None (see the docstring on
+    # set_database_connection for what that silently broke).
+    set_database_connection(sqlite3.connect(DATABASE_PATH))
     logger.info(
         "Starting download date=%s selection=%s database=%s",
         download_date.isoformat(), NEWSPAPER_SELECTION, DATABASE_PATH,
@@ -300,7 +329,7 @@ if __name__ == "__main__":
 
     all_uploads = mal_uploads + km_uploads
     export_manifest(DB_CONNECTION, MANIFEST_PATH)
-    DB_CONNECTION.close()
+    close_database_connection()
     today_date = download_date.strftime("%d-%b-%Y")
     logger.info("Completed uploads=%d manifest=%s", len(all_uploads), MANIFEST_PATH)
 

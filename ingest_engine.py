@@ -342,11 +342,18 @@ def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):
     # 2. Extract text from PDF
     pages = extract_text_from_pdf(pdf_path)
 
+    # A newspaper PDF is frequently *partially* scanned: some pages carry an
+    # embedded text layer while others are pure images. The old branch only
+    # asked "did ANY page yield text?" and then handled the whole document in
+    # text mode, silently discarding every image-only page — for these papers
+    # that is often page 2, where the fuel and gold price tables live. Track the
+    # pages that produced nothing and OCR those specifically.
+    text_pages = [(n, t) for (n, t) in pages if t and t.strip()]
+    blank_pages = [n for (n, t) in pages if not (t and t.strip())]
+
     # 3. Standard Text Extraction ရပါက Text Mode သုံးမည်
-    if pages and any(p[1].strip() for p in pages):
-        for page_no, page_text in pages:
-            if not page_text.strip():
-                continue
+    if text_pages:
+        for page_no, page_text in text_pages:
             articles = parse_articles_with_gemini_text(page_no, page_text, newspaper_name, issue_date)
             for art in articles:
                 h = str(art.get("headline", "")).strip()
@@ -364,9 +371,13 @@ def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):
                         if any(k in h for k in ["ဈေး", "နှုန်း", "ရင်းနှီးမြှုပ်နှံမှု", "စပါး", "ဘဏ္ဍာ"]):
                             extract_numbers_into_db(h, b, issue_date, "စီးပွားရေး")
 
-    # 4. Text extraction မရပါက (Scanned Image PDF ဖြစ်ပါက) Gemini Native PDF Vision သုံးမည်
-    else:
-        logger.info("📸 Standard Text extraction yielded no text. Switching to Gemini Native PDF Vision for %s...", newspaper_name)
+    # 4. စာသားမရသော စာမျက်နှာများ (Scanned Image Pages) ကို Gemini Native PDF
+    #    Vision ဖြင့် သီးသန့် ဖတ်မည်။ pages လုံးဝမရပါကလည်း ဤနေရာသို့ ရောက်သည်။
+    if blank_pages or not text_pages:
+        logger.info(
+            "📸 %d page(s) yielded no text layer; using Gemini Native PDF Vision for %s...",
+            len(blank_pages), newspaper_name,
+        )
         articles = parse_articles_with_gemini_native_pdf(pdf_path, newspaper_name, issue_date)
         for art in articles:
             h = str(art.get("headline", "")).strip()
