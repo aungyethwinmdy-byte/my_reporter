@@ -177,7 +177,7 @@ class DownloadDatabaseTests(unittest.TestCase):
 class ModuleImportTests(unittest.TestCase):
     """Missing credentials / optional libs ကြောင့် import မပျက်စေရန် အာမခံချက်။"""
 
-    CORE = ("database", "notifications", "utils", "ingest_engine", "main")
+    CORE = ("database", "notifications", "utils", "number_utils", "ingest_engine", "main")
     BOT = (
         "telegram_bot",
         "cross_source_verifier",

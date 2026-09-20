@@ -26,6 +26,7 @@ APP_MODULES = (
     "database",
     "notifications",
     "utils",
+    "number_utils",
     "ingest_engine",
     "main",
     "auto_numeric_extractor",

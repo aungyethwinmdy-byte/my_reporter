@@ -84,6 +84,23 @@ class CleanNumberValueTests(unittest.TestCase):
         self.assertIsNone(clean_number_value(None))
         self.assertIsNone(clean_number_value("မပါရှိပါ"))
 
+    def test_grouped_thousands_with_non_comma_separators(self):
+        """The dashboard falls back to ``original_value``, stored verbatim.
+
+        ``original_value`` is whatever the model returned, so it arrives as raw
+        Burmese — "၇၊၁၅၀၊၀၀၀". Stripping only "," and taking the leftmost digit
+        run rendered a 7.15-million-kyat gold price as 7.0.
+        """
+        self.assertEqual(clean_number_value("၇၊၁၅၀၊၀၀၀"), 7_150_000.0)
+        self.assertEqual(clean_number_value("1 500 000"), 1_500_000.0)
+        self.assertEqual(clean_number_value("7\u00a0150\u00a0000"), 7_150_000.0)
+
+    def test_separators_that_are_not_grouping_are_left_alone(self):
+        """Two numbers must not be fused into one enormous wrong value."""
+        self.assertEqual(clean_number_value("၂၅၀၀၊၂၆၀၀"), 2500.0)
+        self.assertEqual(clean_number_value("2500 300"), 2500.0)
+        self.assertEqual(clean_number_value("2500 ကျပ်"), 2500.0)
+
 
 class SimplifyItemNameTests(unittest.TestCase):
     def test_strips_the_reference_price_suffix(self):

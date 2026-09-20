@@ -8,6 +8,8 @@ Supports: Fuel, Gold, Currency, Commodities, and Statistics.
 
 import re
 
+from number_utils import collapse_grouped_thousands
+
 BURMESE_DIGIT_MAP = str.maketrans("၀၁၂၃၄၅၆၇၈၉", "0123456789")
 TO_BURMESE_MAP = str.maketrans("0123456789", "၀၁၂၃၄၅၆၇၈၉")
 
@@ -76,10 +78,18 @@ def to_burmese_digits(num_str) -> str:
 
 
 def clean_number_value(val_str) -> float | None:
-    """ဂဏန်းစာသားမှ Float တန်ဖိုး ထုတ်ယူခြင်း"""
+    """ဂဏန်းစာသားမှ Float တန်ဖိုး ထုတ်ယူခြင်း
+
+    Separator ဖြုတ်ခြင်းကို ``number_utils.collapse_grouped_thousands`` နှင့်
+    မျှဝေထားသည်။ ဤဘက်တွင် အရေးကြီးသည့်အချက်မှာ dashboard က ``value`` မရှိပါက
+    ``original_value`` သို့ ပြန်ကျပြီး ထို field ကို မော်ဒယ်မှ တိုက်ရိုက်သိမ်းထားခြင်း
+    ဖြစ်သည် — ဆိုလိုသည်မှာ "၇၊၁၅၀၊၀၀၀" ကဲ့သို့ မူရင်းမြန်မာစာသား အတိအကျဖြစ်သည်။
+    "," သာဖြုတ်ပြီး ဘယ်ဘုံးဆုံးဂဏန်းကို ယူခြင်းက ၇.၁၅ သန်း ကျပ်ဈေးကို 7.0
+    အဖြစ် ပြသခဲ့သည်။
+    """
     if val_str is None:
         return None
-    s = normalize_digits(str(val_str)).replace(",", "").strip()
+    s = collapse_grouped_thousands(normalize_digits(str(val_str)).replace(",", "").strip())
     match = re.search(r"[-+]?\d+(?:\.\d+)?", s)
     if match:
         try:
