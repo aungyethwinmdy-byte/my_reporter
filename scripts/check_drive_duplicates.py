@@ -23,33 +23,41 @@ suffix so duplicates are obvious. It is READ-ONLY: it never deletes or renames.
 
 USAGE
 -----
-Run from the repo root so ``load_dotenv()`` finds ``.env``::
+Locally (from the repo root, so ``load_dotenv()`` finds ``.env``)::
 
     python scripts/check_drive_duplicates.py
+
+Or without any local setup via the "Check Drive Duplicates" GitHub workflow,
+which already has the Drive credentials available as repository secrets.
 
 Requires GDRIVE_REFRESH_TOKEN / GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET.
 Folder IDs default to the ones in main.py and can be overridden with
 MAL_FOLDER_ID / KM_FOLDER_ID.
+
+This script deliberately does NOT import main.py. main pulls in the whole
+scraping/ingest stack (requests, supabase, google-genai, pdfplumber, ...) which
+would make it far heavier than this read-only check needs, and would also emit
+unrelated import-time warnings. The two folder IDs are duplicated here instead.
 """
 
 import os
 import re
-import sys
 from collections import defaultdict
-from pathlib import Path
 
-# Import from the repo root, not from scripts/.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+try:
+    from dotenv import load_dotenv
 
-from dotenv import load_dotenv  # noqa: E402
+    load_dotenv()
+except ImportError:
+    # Optional: on CI the values come from the environment directly.
+    pass
 
-load_dotenv()
+# Mirrors the defaults in main.py. Overridable via env.
+DEFAULT_MAL_FOLDER_ID = "1o1dwvEyIN-lqOTRSmRiT11oDbpy5M7rf"
+DEFAULT_KM_FOLDER_ID = "1cuClWkahxcWv39GvEUqy-k2Ou1jYgGfh"
 
-import main  # noqa: E402
-
-# Imported lazily-ish: main.py already guards these behind try/except ImportError
-# so the test suite can run without the Drive SDK, and this script must not
-# crash outright when it is absent either.
+# The SDK is optional at import time so this script can still explain itself
+# (rather than dumping a traceback) when the dependency is absent.
 try:
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
@@ -82,7 +90,12 @@ def build_service():
         token_uri="https://oauth2.googleapis.com/token",
         client_id=client_id,
         client_secret=client_secret,
-        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        # Match main.py exactly. A refresh token is bound to the scopes granted
+        # when it was issued, so asking for a narrower scope here risks an
+        # invalid_scope failure on refresh. This script is read-only in what it
+        # DOES (only files().list() is ever called) regardless of the breadth of
+        # the credential it is handed.
+        scopes=["https://www.googleapis.com/auth/drive"],
     )
     return build("drive", "v3", credentials=creds)
 
@@ -161,8 +174,8 @@ def main_entry():
     if service is None:
         return 1
 
-    mal_id = os.environ.get("MAL_FOLDER_ID") or main.MAL_FOLDER_ID
-    km_id = os.environ.get("KM_FOLDER_ID") or main.KM_FOLDER_ID
+    mal_id = os.environ.get("MAL_FOLDER_ID") or DEFAULT_MAL_FOLDER_ID
+    km_id = os.environ.get("KM_FOLDER_ID") or DEFAULT_KM_FOLDER_ID
 
     try:
         mal_files = list_folder(service, mal_id, "မြန်မာ့အလင်း (Myanma Alinn)")
