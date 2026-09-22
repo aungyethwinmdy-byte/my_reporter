@@ -142,7 +142,15 @@ def extract_numbers_into_db(headline: str, body_text: str, pub_date: str, sectio
         if items and isinstance(items, list):
             rows = []
             for it in items:
+                if not isinstance(it, dict):
+                    continue
                 v = clean_number(str(it.get("value", "")))
+                if not v:
+                    # ဂဏန်းမထွက်ပါက newspaper_numbers.value ထဲ စာသား မထည့်ပါ။
+                    # (auto_numeric_extractor နှင့် တူညီသော မူဝါဒ — the reader
+                    # parses this column as a number, so a text value is a
+                    # broken row rather than a usable fallback.)
+                    continue
                 rows.append({
                     "publication_date": pub_date,
                     "headline": headline,

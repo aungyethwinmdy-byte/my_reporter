@@ -199,6 +199,81 @@ class IngestAndSearchTests(unittest.TestCase):
 
     @patch("ingest_engine.supabase")
     @patch("ingest_engine.gemini_client")
+    def test_rows_without_a_number_are_not_inserted(self, mock_gemini, mock_supabase):
+        """Same policy as auto_numeric_extractor: no digits, no row.
+
+        This is the third writer of `newspaper_numbers.value` and it was the
+        only one that stored a valueless row. The dashboard parses that column
+        as a number, so a text value there is a broken row rather than a usable
+        fallback. A live sample had two rows with value='C' from the older
+        echo-the-input behaviour; the current code can no longer produce them.
+        """
+        extracted = [
+            {"context": "ဇယားကွက်", "value": "C", "original_value": "C"},
+            {"context": "Octane 92", "value": "၃,၀၅၀", "original_value": "၃,၀၅၀"},
+        ]
+        inserted_rows = []
+        mock_table = MagicMock()
+        mock_table.insert.side_effect = lambda rows: MagicMock(
+            execute=lambda: inserted_rows.extend(rows)
+        )
+        mock_supabase.from_.return_value = mock_table
+
+        with patch("ingest_engine.extract_numbers_from_article", return_value=extracted):
+            extract_numbers_into_db(
+                headline="စက်သုံးဆီ ဈေးနှုန်း ထုတ်ပြန်",
+                body_text="Octane 92 တစ်လီတာ ၃,၀၅၀ ကျပ် ရောင်းချလျက်ရှိသည်။",
+                pub_date="2026-09-17",
+                section="စက်သုံးဆီ",
+            )
+
+        self.assertEqual([row["value"] for row in inserted_rows], ["3050"])
+
+    @patch("ingest_engine.supabase")
+    @patch("ingest_engine.gemini_client")
+    def test_a_wholly_non_numeric_extraction_inserts_nothing(
+        self, mock_gemini, mock_supabase
+    ):
+        mock_table = MagicMock()
+        mock_supabase.from_.return_value = mock_table
+
+        with patch(
+            "ingest_engine.extract_numbers_from_article",
+            return_value=[{"value": "C", "original_value": "C"}],
+        ):
+            extract_numbers_into_db(
+                headline="ဈေးနှုန်း",
+                body_text="ဇယားကွက် C ကို 1234 ဟု ဖော်ပြထားသည်။",
+                pub_date="2026-09-17",
+            )
+
+        mock_table.insert.assert_not_called()
+
+    @patch("ingest_engine.supabase")
+    @patch("ingest_engine.gemini_client")
+    def test_non_dict_extraction_entries_are_skipped(self, mock_gemini, mock_supabase):
+        """A model that returns bare scalars must not abort the whole insert."""
+        inserted_rows = []
+        mock_table = MagicMock()
+        mock_table.insert.side_effect = lambda rows: MagicMock(
+            execute=lambda: inserted_rows.extend(rows)
+        )
+        mock_supabase.from_.return_value = mock_table
+
+        with patch(
+            "ingest_engine.extract_numbers_from_article",
+            return_value=["oops", {"value": "3050"}],
+        ):
+            extract_numbers_into_db(
+                headline="ဈေးနှုန်း",
+                body_text="အောက်တိန်း ၉၂ ၃၀၅၀ ကျပ် ဖြစ်သည်။",
+                pub_date="2026-09-17",
+            )
+
+        self.assertEqual([row["value"] for row in inserted_rows], ["3050"])
+
+    @patch("ingest_engine.supabase")
+    @patch("ingest_engine.gemini_client")
     def test_ingest_numeric_flow_skips_when_no_digits(self, mock_gemini, mock_supabase):
         with patch("ingest_engine.extract_numbers_from_article") as mock_extract:
             extract_numbers_into_db(
