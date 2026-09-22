@@ -5,6 +5,7 @@ fallback chain, numeric ingestion flow with Burmese digit normalization, page-2-
 search order, and scanned-PDF native vision fallback.
 """
 
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -347,6 +348,167 @@ class VisionFallbackSelectionTests(unittest.TestCase):
         """No blank pages means no OCR call — that would be wasted tokens."""
         _, native = self._run([(1, "text"), (2, "text")])
         self.assertFalse(native.called)
+
+
+class VisionPassIsScopedToBlankPagesTests(unittest.TestCase):
+    """The vision call must see only the pages that produced no text.
+
+    It used to be handed the whole PDF, so for a partially-scanned issue the
+    model re-extracted the text pages too — and those articles had already been
+    inserted by the text pass, so each one landed twice:
+
+        rows inserted: [(1, 'စက်သုံးဆီဈေးနှုန်း'), (1, 'စက်သုံးဆီဈေးနှုန်း')]
+    """
+
+    def _run(self, pages, native_articles, text_articles=None):
+        inserted = []
+        seen_paths = []
+
+        def record_insert(rec):
+            inserted.append(rec["headline"])
+            return True
+
+        def record_vision(path, newspaper, issue_date):
+            seen_paths.append(path)
+            return native_articles
+
+        with patch.object(ie, "extract_page2_tables", return_value=[]), patch.object(
+            ie, "extract_text_from_pdf", return_value=pages
+        ), patch.object(
+            ie, "parse_articles_with_gemini_native_pdf", side_effect=record_vision
+        ), patch.object(
+            ie, "parse_articles_with_gemini_text", return_value=text_articles or []
+        ), patch.object(
+            ie, "insert_article_to_supabase", side_effect=record_insert
+        ), patch.object(
+            ie.os.path, "exists", return_value=True
+        ), patch.object(
+            ie, "supabase", object()
+        ):
+            ok = ie.process_and_ingest_pdf("x.pdf", "ကြေးမုံ", "2026-09-18")
+        return ok, inserted, seen_paths
+
+    def test_text_page_article_is_not_inserted_twice(self):
+        """The headline the text pass stored must not come back from vision."""
+        article = [{"headline": "စက်သုံးဆီဈေးနှုန်း", "body_text": "body", "page_no": 1}]
+        _, inserted, _ = self._run(
+            [(1, "text layer"), (2, "")], native_articles=article, text_articles=article
+        )
+        self.assertEqual(inserted, ["စက်သုံးဆီဈေးနှုန်း"])
+
+    def test_vision_still_adds_pages_the_text_pass_missed(self):
+        _, inserted, _ = self._run(
+            [(1, "text layer"), (2, "")],
+            native_articles=[{"headline": "OCR ခေါင်းစဉ်", "body_text": "b", "page_no": 2}],
+            text_articles=[{"headline": "စာသားခေါင်းစဉ်", "body_text": "b", "page_no": 1}],
+        )
+        self.assertEqual(inserted, ["စာသားခေါင်းစဉ်", "OCR ခေါင်းစဉ်"])
+
+    def test_vision_receives_a_subset_not_the_original_file(self):
+        """Guards the call site, not just the helper.
+
+        Needs a real multi-page PDF on disk, because the subset builder falls
+        back to the original file when it cannot read the source — which is the
+        behaviour the other tests in this class rely on with their fake path.
+        """
+        from pypdf import PdfWriter
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        writer = PdfWriter()
+        for _ in range(3):
+            writer.add_blank_page(width=200, height=200)
+        source = os.path.join(tmp.name, "issue.pdf")
+        with open(source, "wb") as handle:
+            writer.write(handle)
+
+        seen = []
+        with patch.object(ie, "extract_page2_tables", return_value=[]), patch.object(
+            ie, "extract_text_from_pdf", return_value=[(1, "text"), (2, ""), (3, "")]
+        ), patch.object(
+            ie, "parse_articles_with_gemini_text", return_value=[]
+        ), patch.object(
+            ie,
+            "parse_articles_with_gemini_native_pdf",
+            side_effect=lambda path, newspaper, issue_date: seen.append(path) or [],
+        ), patch.object(
+            ie, "insert_article_to_supabase", return_value=True
+        ), patch.object(
+            ie, "supabase", object()
+        ):
+            ie.process_and_ingest_pdf(source, "ကြေးမုံ", "2026-09-18")
+
+        self.assertEqual(len(seen), 1)
+        self.assertNotEqual(
+            seen[0], source, "vision must not be handed the whole document"
+        )
+        self.assertFalse(
+            os.path.exists(seen[0]), "the temporary subset must be cleaned up"
+        )
+
+    def test_page2_table_headline_is_also_deduplicated(self):
+        table = [{"headline": "ရည်ညွှန်းလက်ကားဈေးနှုန်းများ", "body_text": "b", "section": "စက်သုံးဆီ"}]
+        inserted = []
+        with patch.object(ie, "extract_page2_tables", return_value=table), patch.object(
+            ie, "extract_text_from_pdf", return_value=[(1, "text"), (2, "")]
+        ), patch.object(
+            ie,
+            "parse_articles_with_gemini_native_pdf",
+            return_value=[{"headline": "ရည်ညွှန်းလက်ကားဈေးနှုန်းများ", "body_text": "b", "page_no": 2}],
+        ), patch.object(
+            ie, "parse_articles_with_gemini_text", return_value=[]
+        ), patch.object(
+            ie, "extract_numbers_into_db"
+        ), patch.object(
+            ie, "insert_article_to_supabase", side_effect=lambda rec: inserted.append(rec["headline"]) or True
+        ), patch.object(
+            ie.os.path, "exists", return_value=True
+        ), patch.object(
+            ie, "supabase", object()
+        ):
+            ie.process_and_ingest_pdf("x.pdf", "ကြေးမုံ", "2026-09-18")
+        self.assertEqual(inserted, ["ရည်ညွှန်းလက်ကားဈေးနှုန်းများ"])
+
+
+class BuildPageSubsetPdfTests(unittest.TestCase):
+    def _make_pdf(self, pages):
+        from pypdf import PdfWriter
+
+        writer = PdfWriter()
+        for _ in range(pages):
+            writer.add_blank_page(width=200, height=200)
+        path = os.path.join(self.tmp.name, f"{pages}p.pdf")
+        with open(path, "wb") as handle:
+            writer.write(handle)
+        return path
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_keeps_only_the_requested_pages(self):
+        from pypdf import PdfReader
+
+        source = self._make_pdf(5)
+        subset = ie.build_page_subset_pdf(source, [2, 4])
+        self.addCleanup(lambda: os.path.exists(subset) and os.remove(subset))
+        self.assertIsNotNone(subset)
+        self.assertEqual(len(PdfReader(subset).pages), 2)
+
+    def test_out_of_range_pages_are_ignored(self):
+        source = self._make_pdf(2)
+        subset = ie.build_page_subset_pdf(source, [1, 99])
+        self.addCleanup(lambda: os.path.exists(subset) and os.remove(subset))
+        self.assertIsNotNone(subset)
+        from pypdf import PdfReader
+
+        self.assertEqual(len(PdfReader(subset).pages), 1)
+
+    def test_no_pages_returns_none(self):
+        self.assertIsNone(ie.build_page_subset_pdf(self._make_pdf(2), []))
+
+    def test_unreadable_file_returns_none_instead_of_raising(self):
+        self.assertIsNone(ie.build_page_subset_pdf("does-not-exist.pdf", [1]))
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import os
 import re
 import json
 import logging
+import tempfile
 
 from env_config import get_gemini_api_key, get_supabase_credentials
 
@@ -94,6 +95,7 @@ __all__ = [
     "extract_numbers_into_db",
     "extract_page2_tables",
     "insert_article_to_supabase",
+    "build_page_subset_pdf",
 ]
 
 
@@ -314,6 +316,45 @@ Return strictly JSON array:
         return []
 
 
+def build_page_subset_pdf(pdf_path, page_numbers):
+    """Copy just ``page_numbers`` (1-based) into a temporary PDF.
+
+    Returns the temp path, or None when the subset cannot be built — the caller
+    then falls back to the original file rather than losing the vision pass.
+    """
+    if not page_numbers:
+        return None
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except Exception as err:  # pypdf is optional at import time
+        logger.warning("⚠️ pypdf unavailable, cannot subset pages: %s", err)
+        return None
+
+    temp_path = None
+    try:
+        reader = PdfReader(pdf_path)
+        writer = PdfWriter()
+        for page_no in page_numbers:
+            index = int(page_no) - 1
+            if 0 <= index < len(reader.pages):
+                writer.add_page(reader.pages[index])
+        if not writer.pages:
+            return None
+        handle, temp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(handle)
+        with open(temp_path, "wb") as out_file:
+            writer.write(out_file)
+        return temp_path
+    except Exception as err:
+        logger.warning("⚠️ Could not build the blank-page subset: %s", err)
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        return None
+
+
 def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):
     """သတင်းစာ PDF တစ်စောင်လုံးကို Ingest ပြုလုပ်သည့် အဓိက လုပ်ဆောင်ချက်"""
     logger.info("🚀 Processing Ingestion: %s (%s) | File: %s", newspaper_name, issue_date, pdf_path)
@@ -323,6 +364,10 @@ def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):
         return False
 
     total_ingested = 0
+    # Headlines already stored during this run. The vision pass re-reads the PDF
+    # and can hand back pages that the text pass already covered, so this keeps a
+    # single issue from inserting the same article twice.
+    ingested_headlines = set()
 
     # 1. Page-2 fuel/gold table boxes via pdfplumber (ingested first)
     p2_tables = extract_page2_tables(pdf_path)
@@ -337,6 +382,7 @@ def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):
         }
         if insert_article_to_supabase(rec):
             total_ingested += 1
+            ingested_headlines.add(rec["headline"].strip())
             extract_numbers_into_db(tbl["headline"], tbl["body_text"], issue_date, sec)
 
     # 2. Extract text from PDF
@@ -368,6 +414,7 @@ def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):
                     }
                     if insert_article_to_supabase(rec):
                         total_ingested += 1
+                        ingested_headlines.add(h)
                         if any(k in h for k in ["ဈေး", "နှုန်း", "ရင်းနှီးမြှုပ်နှံမှု", "စပါး", "ဘဏ္ဍာ"]):
                             extract_numbers_into_db(h, b, issue_date, "စီးပွားရေး")
 
@@ -378,22 +425,49 @@ def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):
             "📸 %d page(s) yielded no text layer; using Gemini Native PDF Vision for %s...",
             len(blank_pages), newspaper_name,
         )
-        articles = parse_articles_with_gemini_native_pdf(pdf_path, newspaper_name, issue_date)
+
+        # Send ONLY the pages that produced no text. Handing over the whole file
+        # made the model re-extract every text page as well, and those articles
+        # had already been inserted above — so each partially-scanned issue
+        # stored its text pages twice. When every page is blank the subset would
+        # be the whole document, so skip the copy; when the subset cannot be
+        # built, fall back to the original rather than losing the price tables.
+        vision_path = None
+        if blank_pages and text_pages:
+            vision_path = build_page_subset_pdf(pdf_path, blank_pages)
+        try:
+            articles = parse_articles_with_gemini_native_pdf(
+                vision_path or pdf_path, newspaper_name, issue_date
+            )
+        finally:
+            if vision_path:
+                try:
+                    os.remove(vision_path)
+                except OSError:
+                    pass
+
         for art in articles:
             h = str(art.get("headline", "")).strip()
             b = str(art.get("body_text", "")).strip()
-            if h and b:
-                rec = {
-                    "newspaper_name": str(newspaper_name),
-                    "issue_date": str(issue_date),
-                    "page_no": int(art.get("page_no") or 1),
-                    "headline": h,
-                    "body_text": b,
-                }
-                if insert_article_to_supabase(rec):
-                    total_ingested += 1
-                    if any(k in h for k in ["ဈေး", "နှုန်း", "ရင်းနှီးမြှုပ်နှံမှု", "စပါး", "ဘဏ္ဍာ"]):
-                        extract_numbers_into_db(h, b, issue_date, "စီးပွားရေး")
+            if not h or not b:
+                continue
+            # Belt and braces: the subset is best-effort, and a model may still
+            # return a text-page article it saw in the fallback file.
+            if h in ingested_headlines:
+                logger.debug("Skipping duplicate headline from vision pass: %s", h[:60])
+                continue
+            rec = {
+                "newspaper_name": str(newspaper_name),
+                "issue_date": str(issue_date),
+                "page_no": int(art.get("page_no") or 1),
+                "headline": h,
+                "body_text": b,
+            }
+            if insert_article_to_supabase(rec):
+                total_ingested += 1
+                ingested_headlines.add(h)
+                if any(k in h for k in ["ဈေး", "နှုန်း", "ရင်းနှီးမြှုပ်နှံမှု", "စပါး", "ဘဏ္ဍာ"]):
+                    extract_numbers_into_db(h, b, issue_date, "စီးပွားရေး")
 
     logger.info("✅ Successful Ingestion: %d articles inserted for %s (%s).", total_ingested, newspaper_name, issue_date)
     return total_ingested > 0
