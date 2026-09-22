@@ -201,6 +201,76 @@ def extract_page2_tables(pdf_path: str) -> list[dict]:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Text-layer quality
+# ---------------------------------------------------------------------------
+# Some newspaper PDFs embed fonts that carry no /ToUnicode CMap, so their "text
+# layer" is really a run of *glyph indices* rather than Unicode. Every engine
+# exposes that differently — all three strings below were captured from the
+# live moi.gov.mm မြန်မာ့အလင်း issue of 13 Sep 2026:
+#
+#   pypdf       "/g194/g196/g201/g201/g3/g3"         (glyph *names*)
+#   PyMuPDF     "\x02\x03\x04\x04\x05\x05\x06\x07"   (raw glyph ids as control bytes)
+#   pdfplumber  "(cid:5)3(cid:30)(cid:21)(cid:15)"    (CID codes)
+#
+# None of these is blank, so the old `any(t[1].strip() ...)` acceptance test
+# took them for real text: the garbage was handed to Gemini as if it were
+# Burmese, and because the page counted as a *text* page the vision pass never
+# saw it either. That is how 384 rows — 9% of the stored corpus, and 58% of
+# every မြန်မာ့အလင်း row — ended up holding "/g167/g136/g3/..." instead of news.
+_GLYPH_NAME_RE = re.compile(r"/g\d+")
+_CID_CODE_RE = re.compile(r"\(cid:\d+\)")
+# Any Unicode letter (Latin, Burmese, ...) means the layer decoded properly.
+# \w covers letters, digits and "_", so [^\W\d_] is exactly "a letter".
+_LETTER_RE = re.compile(r"[^\W\d_]")
+# C0 controls other than \t \n \r — where raw glyph ids land.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# Thresholds, both measured on the live PDFs (scripts/probe_artefact_ratio.py,
+# 32 pages each, all three engines):
+#
+#                         broken မြန်မာ့အလင်း      clean ကြေးမုံ
+#   artefact ratio       0.550 – 0.992          0.000 – 0.093
+#   letter ratio         0.000 – 0.080          0.326 – 0.408
+#
+# 0.30 sits 3.2x above the worst clean page and 1.8x below the best broken one.
+# The letter ratio is a second, independent veto: no page that is even 20%
+# letters can be mistaken for glyph noise, whatever else it contains.
+_ARTEFACT_RATIO = 0.30
+_LETTER_RATIO = 0.20
+
+
+def looks_like_glyph_noise(text):
+    """စာသား မဟုတ်ဘဲ font glyph code များ ဖြစ်နေပါက True ပြန်ပေးခြင်း။
+
+    True when `text` is a PDF text layer of glyph indices rather than text.
+
+    A page is only called noise when machine artefacts dominate *and* real
+    letters are scarce — a page that is merely numeric, or that carries a few
+    stray ``(cid:N)`` codes for special symbols, keeps its text.
+    """
+    if not text or not text.strip():
+        return False
+
+    stripped = _CID_CODE_RE.sub("", _GLYPH_NAME_RE.sub("", text))
+    artefacts = len(text) - len(stripped) + len(_CONTROL_RE.findall(stripped))
+    if artefacts / len(text) < _ARTEFACT_RATIO:
+        return False
+
+    # Plenty of real letters means the layer decoded, whatever else is in it.
+    return len(_LETTER_RE.findall(stripped)) / len(text) < _LETTER_RATIO
+
+
+def is_usable_page_text(text):
+    """စာမျက်နှာတစ်ခု၏ text layer သည် အသုံးပြုနိုင်ပါက True ပြန်ပေးခြင်း။
+
+    A page may take part in the text pass only if its text layer decoded into
+    real characters. Pages that fail this go to the Gemini vision pass instead,
+    which reads the rendered page image and therefore does not care that the
+    embedded font has no Unicode mapping.
+    """
+    return bool(text and text.strip()) and not looks_like_glyph_noise(text)
+
+
 def extract_text_from_pdf(pdf_path):
     """PDF ဖိုင်မှ စာသားများကို Standard Engine များဖြင့် ထုတ်ယူခြင်း"""
     pages_text = []
@@ -212,7 +282,7 @@ def extract_text_from_pdf(pdf_path):
         for idx, page in enumerate(reader.pages):
             txt = page.extract_text() or ""
             pages_text.append((idx + 1, txt))
-        if any(t[1].strip() for t in pages_text):
+        if any(is_usable_page_text(t) for _, t in pages_text):
             return pages_text
     except Exception:
         pass
@@ -224,7 +294,7 @@ def extract_text_from_pdf(pdf_path):
         pages_text = []
         for idx, page in enumerate(doc):
             pages_text.append((idx + 1, page.get_text()))
-        if any(t[1].strip() for t in pages_text):
+        if any(is_usable_page_text(t) for _, t in pages_text):
             return pages_text
     except Exception:
         pass
@@ -237,14 +307,15 @@ def extract_text_from_pdf(pdf_path):
                 for idx, page in enumerate(pdf.pages):
                     txt = page.extract_text() or ""
                     pages_text.append((idx + 1, txt))
-                if any(t[1].strip() for t in pages_text):
+                if any(is_usable_page_text(t) for _, t in pages_text):
                     return pages_text
         except Exception:
             pass
 
     logger.warning(
-        "⚠️ pypdf/PyMuPDF/pdfplumber ဖြင့် စာသား ထုတ်ယူ၍ မရပါ "
-        "(library မရှိခြင်း သို့မဟုတ် scanned PDF ဖြစ်ခြင်း)။ "
+        "⚠️ pypdf/PyMuPDF/pdfplumber ဖြင့် အသုံးပြုနိုင်သော စာသား ထုတ်ယူ၍ မရပါ "
+        "(library မရှိခြင်း၊ scanned PDF ဖြစ်ခြင်း သို့မဟုတ် font များတွင် "
+        "Unicode mapping မရှိခြင်း)။ "
         "Gemini Native PDF Vision သို့ ပြောင်းပါမည်。"
     )
     return pages_text
@@ -298,6 +369,19 @@ Return strictly JSON in this format:
 def parse_articles_with_gemini_text(page_no, page_text, newspaper_name, issue_date):
     """Text-based PDF များအတွက် Gemini AI Parsing"""
     if not gemini_client or not page_text.strip():
+        return []
+
+    # Last gate before rows reach Supabase. Handing a glyph-encoded page to the
+    # model does not fail loudly — it happily echoes "/g194/g196/g201" back as
+    # the headline and body, and those rows then pollute retrieval and inflate
+    # /status counts. The caller already routes such pages to vision; this keeps
+    # the guarantee even if a future caller forgets.
+    if looks_like_glyph_noise(page_text):
+        logger.warning(
+            "⚠️ Page %s of %s has a glyph-encoded text layer (no Unicode "
+            "mapping); skipping the text pass — the vision pass must read it.",
+            page_no, newspaper_name,
+        )
         return []
 
     prompt = f"""
@@ -402,8 +486,14 @@ def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):
     # text mode, silently discarding every image-only page — for these papers
     # that is often page 2, where the fuel and gold price tables live. Track the
     # pages that produced nothing and OCR those specifically.
-    text_pages = [(n, t) for (n, t) in pages if t and t.strip()]
-    blank_pages = [n for (n, t) in pages if not (t and t.strip())]
+    #
+    # "Yielded text" has to mean *usable* text. A page whose fonts have no
+    # Unicode mapping yields "/g167/g136/g3/..." — non-blank, and previously
+    # enough to mark the whole issue as text-mode, so the vision pass was
+    # skipped and the glyph codes were stored as news. `is_usable_page_text`
+    # treats those pages as blank, which sends them to vision instead.
+    text_pages = [(n, t) for (n, t) in pages if is_usable_page_text(t)]
+    blank_pages = [n for (n, t) in pages if not is_usable_page_text(t)]
 
     # 3. Standard Text Extraction ရပါက Text Mode သုံးမည်
     if text_pages:

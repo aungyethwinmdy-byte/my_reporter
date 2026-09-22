@@ -586,5 +586,306 @@ class BuildPageSubsetPdfTests(unittest.TestCase):
         self.assertIsNone(ie.build_page_subset_pdf("does-not-exist.pdf", [1]))
 
 
+class GlyphEncodedTextLayerTests(unittest.TestCase):
+    """A PDF whose fonts carry no Unicode mapping must not count as "text".
+
+    moi.gov.mm serves မြန်မာ့အလင်း issues whose embedded fonts have no
+    /ToUnicode CMap, so what every engine calls a text layer is really a run of
+    glyph indices. The three literals below are verbatim prefixes from the live
+    13 Sep 2026 issue, page 1 (captured via scripts/probe_engines.py):
+
+        pypdf       19,980 chars of "/g194/g196/g201/g201/g3/g3..."
+        PyMuPDF      4,319 chars of "\\x02\\x03\\x04\\x04\\x05..."
+        pdfplumber  24,673 chars of "(cid:5)3(cid:30)(cid:21)..."
+
+    None of them is blank, so the old `any(t[1].strip() ...)` gate accepted all
+    three: the garbage went to Gemini as if it were Burmese, and because the
+    page counted as a *text* page the vision pass never saw it. 384 rows — 9% of
+    the stored corpus and 58% of every မြန်မာ့အလင်း row — were stored this way,
+    while still inflating /status counts.
+    """
+
+    # verbatim from the live PDF, trimmed to whole tokens (prefixes; the full
+    # pages are homogeneous — artefact ratios 0.550-0.992 over all 32 pages)
+    PYPDF = (
+        "/g194/g196/g201/g201/g3/g3/g135/g179/g247/g191/g139/g187/g203/g3/g3/g181"
+        "/g150/g176/g187/g164/g162/g138/g187/g185/g162/g140/g154/g187/g185/g3/g3"
+        "/g195/g3/g161/g134/g187/g3/g3/g3/g3/g3/g3/g3/g3/g3/g3/g3/g3/g3/g3/g3/g3"
+        "/g3/g3/g3/g3/g3/g3/g3/g195"
+    )
+    # \x02..\x1f are raw glyph ids; \t \n \r are the only whitespace the engine
+    # emitted. Punctuation such as ! " # $ % & ' ( survives — the rule is
+    # ratio-based, so a few non-letter characters cannot rescue the page.
+    FITZ = (
+        "\u0002\u0003\u0004\u0004\u0005\u0005\u0006\u0007\x08\t\n\u000b\f\u0005"
+        "\u0005\r\u000e\u000f\u000b\u0010\u0011\u0012\u000b\u0013\u0011\u0014"
+        "\u0015\u000b\u0013\u0005\u0005\u0016\u0005\u0017\u0018\u000b\u0005\u0005"
+        "\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005"
+        "\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0016\u0019"
+        "\u0016\u001a\u0005\u0005\u0006\u0007\x08\t\n\u000b\f\u0005\u0005\n\u0018"
+        "\u000b\u000e\u0012\u000b\u001b\u000f\u0005\u0002\u0003\u0005\u0017\u0018"
+        "\u000b\f\u0005\u000e\u0015\u001c\u0005\u0005\u001d\r\x08\u001e\r\u0015"
+        "\u001f\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005"
+        "\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005\u0005"
+        "\u0005 \u000e\u001e!\"\u001a#$\f\u0005\u0005 %\t\u000e\u000b\"\u0005"
+        "\u0003&\u0003$\n\u0002\u0003\u0004\u0004\u0005\n\u0006\u0007\u0003\x08"
+        "\t\n\u000b\f\n\u0002\u0003\u0004\u0004\u0004\r\u000e\n\u000f\u000b\u0010"
+        "\t\u0011\u0012\x08\t\n\u0013\u0011\x08\t\n\u0006\u0014\u000f\u000b\u0010"
+        "\t\u0006\u0011\u0003\t\u0004\u0004\u0002\u0015\t\u0011\x08\t\u0016\u0003"
+        "\u0004\u0004\r\u0017\n'\r\u0015\u001f\u0015(\u0015\u0018\u000b\u0005"
+        "\u001a\u0005\u000f\u0017)\u0006\u001e! \u0006*+\u0015\u000b\u0005\u000e"
+    )
+    # Note the stray letters below ("U", "e"): pdfplumber leaks a few real
+    # characters through, which is why the check is a ratio and not "no letters".
+    PDFPLUMBER = (
+        "(cid:5)3(cid:30)(cid:21)(cid:15)(cid:13)(cid:30)(cid:2)(cid:15)(cid:12)"
+        "(cid:13)(cid:22)(cid:21)(cid:14)(cid:15)(cid:22)(cid:9)4(cid:2)(cid:15)"
+        "(cid:22)(cid:17)(cid:15)(cid:14)(cid:16))(cid:12)(cid:13)(cid:22)\n"
+        "(cid:28)U,(cid:15)\"(cid:2)"
+    )
+
+    def test_pypdf_glyph_names_are_noise(self):
+        self.assertTrue(ie.looks_like_glyph_noise(self.PYPDF))
+        self.assertFalse(ie.is_usable_page_text(self.PYPDF))
+
+    def test_pymupdf_raw_glyph_ids_are_noise(self):
+        self.assertTrue(ie.looks_like_glyph_noise(self.FITZ))
+        self.assertFalse(ie.is_usable_page_text(self.FITZ))
+
+    def test_pdfplumber_cid_codes_are_noise(self):
+        self.assertTrue(ie.looks_like_glyph_noise(self.PDFPLUMBER))
+        self.assertFalse(ie.is_usable_page_text(self.PDFPLUMBER))
+
+    def test_real_burmese_is_not_noise(self):
+        """The same file's sibling, ကြေးမုံ, decodes perfectly — keep it."""
+        page = (
+            "၁၃၈၈       ခုနှစ်၊          ေတာ်သလင်းလဆန်း      ၂      ရက်၊ "
+            "နိုင်ငံတော်သမ္မတ ဦးမင်းအောင်လှိုင် ပြည်ထောင်စုအစိုးရအဖွဲ့အစည်းအဝေးသို့ "
+            "တက်ရောက်အမှာစကားပြောကြား"
+        )
+        self.assertFalse(ie.looks_like_glyph_noise(page))
+        self.assertTrue(ie.is_usable_page_text(page))
+
+    def test_english_and_ascii_pages_are_not_noise(self):
+        page = "Sunday, 13 September 2026   Central Bank reference rate 3653-3669"
+        self.assertFalse(ie.looks_like_glyph_noise(page))
+        self.assertTrue(ie.is_usable_page_text(page))
+
+    def test_clean_issue_with_stray_cid_codes_is_not_noise(self):
+        """False-positive guard, with real ကြေးမုံ text.
+
+        pdfplumber emits ``(cid:N)`` for special symbols even in a perfectly
+        good issue — this is verbatim page-1 output from the clean 13 Sep 2026
+        ကြေးမုံ file, and it is ~5% artefacts. A naive "contains (cid:" rule
+        would throw away every page of the good newspaper.
+        """
+        page = (
+            "သွားေလရာအရပ်၌\nအပူေဇာ်ခံရ\nသဒ ါ\ue013တရားလည်းရ၊ှိ သလီ \ue107ငှ လ့် ည်း "
+            "ြပညစ့် ၊ုံ\ne - paper ဖတ်\ue108 \ue1f2ရန် အ(cid:490)ခအံ ရလံ ညး"
+        )
+        self.assertFalse(ie.looks_like_glyph_noise(page))
+        self.assertTrue(ie.is_usable_page_text(page))
+
+    def test_the_thresholds_sit_inside_the_measured_gap(self):
+        """Lock in the margins measured across 32 pages x 3 engines.
+
+        broken မြန်မာ့အလင်း: artefact 0.550-0.992, letters 0.000-0.080
+        clean  ကြေးမုံ:     artefact 0.000-0.093, letters 0.326-0.408
+        """
+        self.assertGreater(ie._ARTEFACT_RATIO, 0.093)
+        self.assertLess(ie._ARTEFACT_RATIO, 0.550)
+        self.assertLess(ie._LETTER_RATIO, 0.326)
+
+    def test_numeric_only_page_is_still_usable(self):
+        """Guard against over-rejection: a figures-only box is not glyph noise.
+
+        The fuel/gold boxes on page 2 are largely digits. They carry no letter,
+        so a naive "no letters => noise" rule would throw away a page that
+        ``extract_page2_tables`` may still want.
+        """
+        page = "92 Ron 3020  3175\n95 Ron 3350  3480\nDiesel 2900  3010\n"
+        self.assertFalse(ie.looks_like_glyph_noise(page))
+        self.assertTrue(ie.is_usable_page_text(page))
+
+    def test_blank_page_is_not_usable_but_is_not_noise(self):
+        for blank in ("", "   ", "\n\t\n"):
+            self.assertFalse(ie.looks_like_glyph_noise(blank))
+            self.assertFalse(ie.is_usable_page_text(blank))
+
+    def test_a_single_stray_glyph_token_does_not_condemn_a_real_page(self):
+        page = "ဈေးနှုန်း ထုတ်ပြန်ချက် /g123 အတွက် ရည်ညွှန်းဈေး ၃၀၅၀ ကျပ်"
+        self.assertFalse(ie.looks_like_glyph_noise(page))
+
+    # -- the real mechanism, on a real glyph-encoded PDF ----------------------
+    def _make_glyph_pdf(self):
+        """A 707-byte PDF whose only font maps codes to glyph names, no ToUnicode.
+
+        This reproduces the moi.gov.mm defect exactly: pypdf resolves the
+        /Differences glyph names and, finding nothing in the Adobe Glyph List,
+        emits the raw names — the same "/g194/g196/g201" the live မြန်မာ့အလင်း
+        issues produce.
+        """
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        ]
+        stream = b"BT /F1 12 Tf 10 50 Td (ABCD) Tj ET"
+        objects.append(
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n"
+            + stream + b"\nendstream"
+        )
+        objects.append(
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /TestGlyphFont "
+            b"/FirstChar 65 /LastChar 68 /Widths [500 500 500 500] "
+            b"/Encoding << /Type /Encoding "
+            b"/Differences [65 /g194 /g196 /g201 /g3] >> >>"
+        )
+
+        out = bytearray(b"%PDF-1.4\n")
+        offsets = []
+        for number, body in enumerate(objects, start=1):
+            offsets.append(len(out))
+            out += str(number).encode() + b" 0 obj\n" + body + b"\nendobj\n"
+        xref = len(out)
+        out += b"xref\n0 " + str(len(objects) + 1).encode() + b"\n0000000000 65535 f \n"
+        for offset in offsets:
+            out += ("%010d 00000 n \n" % offset).encode()
+        out += (
+            b"trailer\n<< /Size " + str(len(objects) + 1).encode()
+            + b" /Root 1 0 R >>\nstartxref\n" + str(xref).encode() + b"\n%%EOF\n"
+        )
+
+        path = os.path.join(self.tmp.name, "glyph_encoded.pdf")
+        with open(path, "wb") as handle:
+            handle.write(bytes(out))
+        return path
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_real_glyph_encoded_pdf_reproduces_the_symptom(self):
+        from pypdf import PdfReader
+
+        text = PdfReader(self._make_glyph_pdf()).pages[0].extract_text() or ""
+        self.assertIn("/g194", text, "fixture must reproduce the live defect")
+        self.assertNotIn("A", text, "the glyph names are not real text")
+        self.assertFalse(ie.is_usable_page_text(text))
+
+    def test_extract_text_falls_through_to_a_working_engine(self):
+        """pypdf is tried first; if its layer is glyph codes we must keep going.
+
+        The old gate stopped at the first engine that returned anything
+        non-blank, so a file that pypdf mangles never reached PyMuPDF — even
+        when PyMuPDF could read it correctly.
+        """
+        good = [(1, "ကြေးမုံ သတင်း စာသား"), (2, "")]
+        with patch.object(
+            ie, "is_usable_page_text", side_effect=ie.is_usable_page_text
+        ), patch("pypdf.PdfReader") as reader, patch("fitz.open") as fitz_open:
+            reader.return_value.pages = [
+                SimpleNamespace(extract_text=lambda: self.PYPDF)
+            ]
+            # bind t per-iteration; a bare `lambda: t` in a comprehension
+            # captures the loop variable and every page would read the last one
+            fitz_open.return_value = [
+                SimpleNamespace(get_text=lambda text=text: text) for _, text in good
+            ]
+
+            result = ie.extract_text_from_pdf("x.pdf")
+
+        self.assertEqual(result, good, "should have fallen through to PyMuPDF")
+
+
+class GlyphPagesAreRoutedToVisionTests(unittest.TestCase):
+    """End-to-end: glyph-encoded pages must reach the vision pass, not the DB.
+
+    ``process_and_ingest_pdf`` decided what was a "text page" with a bare
+    ``t.strip()``, so a glyph-encoded issue looked fully digital: the text pass
+    ran, the vision pass was skipped, and "/g167/g136/g3..." was stored as news.
+    """
+
+    def _run(self, pages, text_articles=None):
+        inserted = []
+        calls = {"text": [], "vision": []}
+
+        def record_text(page_no, page_text, newspaper, issue_date):
+            calls["text"].append(page_no)
+            return text_articles or []
+
+        def record_vision(path, newspaper, issue_date):
+            calls["vision"].append(path)
+            return [{"headline": "OCR ခေါင်းစဉ်", "body_text": "OCR body", "page_no": 1}]
+
+        with patch.object(ie, "extract_page2_tables", return_value=[]), patch.object(
+            ie, "extract_text_from_pdf", return_value=pages
+        ), patch.object(
+            ie, "parse_articles_with_gemini_text", side_effect=record_text
+        ), patch.object(
+            ie, "parse_articles_with_gemini_native_pdf", side_effect=record_vision
+        ), patch.object(
+            ie,
+            "insert_article_to_supabase",
+            side_effect=lambda rec: inserted.append(rec["headline"]) or True,
+        ), patch.object(
+            ie.os.path, "exists", return_value=True
+        ), patch.object(
+            ie, "supabase", object()
+        ):
+            ok = ie.process_and_ingest_pdf("x.pdf", "မြန်မာ့အလင်း", "2026-09-13")
+        return ok, calls, inserted
+
+    def test_glyph_only_issue_goes_to_vision_and_skips_the_text_pass(self):
+        ok, calls, _ = self._run([(1, GlyphEncodedTextLayerTests.PYPDF)])
+
+        self.assertTrue(ok)
+        self.assertEqual(calls["text"], [], "glyph pages must not reach the text pass")
+        self.assertTrue(calls["vision"], "glyph pages must be read by vision")
+
+    def test_no_glyph_text_is_ever_inserted(self):
+        _, _, inserted = self._run([(1, GlyphEncodedTextLayerTests.PYPDF)])
+
+        for headline in inserted:
+            self.assertNotIn("/g", headline)
+
+    def test_mixed_issue_sends_only_the_glyph_pages_to_vision(self):
+        """The digital pages keep the text pass; only the broken ones get OCR'd."""
+        pages = [(1, "ကြေးမုံ အစစ်အမှန် စာသား"), (2, GlyphEncodedTextLayerTests.FITZ)]
+        _, calls, _ = self._run(pages)
+
+        self.assertEqual(calls["text"], [1])
+        self.assertTrue(calls["vision"], "the glyph page still needs vision")
+
+
+class GlyphPageTextGuardTests(unittest.TestCase):
+    """Last line of defence inside the text parser itself."""
+
+    def test_the_model_is_not_called_for_a_glyph_encoded_page(self):
+        client = MagicMock()
+        with patch.object(ie, "gemini_client", client):
+            result = ie.parse_articles_with_gemini_text(
+                1, GlyphEncodedTextLayerTests.PYPDF, "မြန်မာ့အလင်း", "2026-09-13"
+            )
+
+        self.assertEqual(result, [])
+        client.models.generate_content.assert_not_called()
+
+    def test_real_text_still_reaches_the_model(self):
+        """The guard must not block ordinary pages.
+
+        `gemini_client` is None here, so the parser returns before the model
+        call; what this asserts is that a real page is not classified as noise,
+        which is the only thing the new guard could wrongly reject.
+        """
+        with patch.object(ie, "gemini_client", None):
+            self.assertTrue(ie.is_usable_page_text("ဈေးနှုန်း ထုတ်ပြန်ချက် ၃၀၅၀ ကျပ်"))
+            self.assertFalse(
+                ie.is_usable_page_text(GlyphEncodedTextLayerTests.PDFPLUMBER)
+            )
+            self.assertFalse(ie.is_usable_page_text(GlyphEncodedTextLayerTests.FITZ))
+
+
 if __name__ == "__main__":
     unittest.main()
