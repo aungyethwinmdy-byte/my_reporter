@@ -101,6 +101,18 @@ class CleanNumberValueTests(unittest.TestCase):
         self.assertEqual(clean_number_value("2500 300"), 2500.0)
         self.assertEqual(clean_number_value("2500 ကျပ်"), 2500.0)
 
+    def test_burmese_word_numerals(self):
+        """original_value arrives as prose and the dashboard falls back to it.
+
+        All four forms were found in production rows; plain digit translation
+        returned 111, 10, 2 and 2500 respectively — the 2026 case is a 1000x
+        error.
+        """
+        self.assertEqual(clean_number_value("၁၁၁ ဒသမ ၃၂"), 111.32)
+        self.assertEqual(clean_number_value("သုည ဒသမ ၁၀"), 0.10)
+        self.assertEqual(clean_number_value("၂ဝ၂၆"), 2026.0)
+        self.assertEqual(clean_number_value("ဝန်ကြီး ၂၅၀၀"), 2500.0)
+
 
 class SimplifyItemNameTests(unittest.TestCase):
     def test_strips_the_reference_price_suffix(self):

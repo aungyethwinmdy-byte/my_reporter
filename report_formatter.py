@@ -8,9 +8,12 @@ Supports: Fuel, Gold, Currency, Commodities, and Statistics.
 
 import re
 
-from number_utils import collapse_grouped_thousands
+from number_utils import (
+    BURMESE_DIGIT_MAP,
+    collapse_grouped_thousands,
+    normalize_burmese_numerals,
+)
 
-BURMESE_DIGIT_MAP = str.maketrans("၀၁၂၃၄၅၆၇၈၉", "0123456789")
 TO_BURMESE_MAP = str.maketrans("0123456789", "၀၁၂၃၄၅၆၇၈၉")
 
 
@@ -89,7 +92,9 @@ def clean_number_value(val_str) -> float | None:
     """
     if val_str is None:
         return None
-    s = collapse_grouped_thousands(normalize_digits(str(val_str)).replace(",", "").strip())
+    s = collapse_grouped_thousands(
+        normalize_burmese_numerals(val_str).replace(",", "").strip()
+    )
     match = re.search(r"[-+]?\d+(?:\.\d+)?", s)
     if match:
         try:

@@ -20,7 +20,7 @@ from auto_numeric_extractor import (
     extract_numbers_from_article,
     ingest_article_numbers,
 )
-from number_utils import collapse_grouped_thousands
+from number_utils import collapse_grouped_thousands, normalize_burmese_numerals
 from report_formatter import clean_number_value
 
 
@@ -97,6 +97,32 @@ class CleanNumberTests(unittest.TestCase):
 
     def test_range_keeps_the_lower_bound(self):
         self.assertEqual(clean_number("၂,၅၀၀-၂,၆၀၀"), "2500")
+
+    def test_burmese_word_decimal_is_understood(self):
+        """ဒသမ is the Burmese word for "decimal point".
+
+        All three of these forms were found in production `original_value` rows;
+        plain digit translation turned them into 111, 10 and 2.
+        """
+        self.assertEqual(clean_number("၁၁၁ ဒသမ ၃၂"), "111.32")
+        self.assertEqual(clean_number("၉၆ ဒသမ ၉၅"), "96.95")
+        self.assertEqual(clean_number("၅ ဒသမ ၅ - ၇ ဒသမ ၂"), "5.5")
+
+    def test_word_zero_before_a_decimal_is_understood(self):
+        self.assertEqual(clean_number("သုည ဒသမ ၁၀"), "0.10")
+
+    def test_letter_wa_used_as_zero_between_digits(self):
+        """"၂ဝ၂၆" is 2026 written with the letter ဝ standing in for zero.
+
+        Parsed as "2" — a 1000x error.
+        """
+        self.assertEqual(clean_number("၂ဝ၂၆"), "2026")
+        self.assertEqual(clean_number("၂ဝ၂၇"), "2027")
+
+    def test_letter_wa_elsewhere_in_the_text_is_left_alone(self):
+        """Blanket ဝ -> 0 would turn "ဝန်ကြီး ၂၅၀၀" into "0..." and parse as 0."""
+        self.assertEqual(clean_number("ဝန်ကြီး ၂၅၀၀"), "2500")
+        self.assertEqual(clean_number("ဝ၉-၄၂၁၁၂၄၈၄ဝ"), "9")
 
 
 class ParseExtractedJsonTests(unittest.TestCase):
@@ -273,6 +299,29 @@ class IngestArticleNumbersTests(unittest.TestCase):
         self.assertEqual([r["value"] for r in self.table.rows], ["2500"])
 
 
+class NormalizeBurmeseNumeralsTests(unittest.TestCase):
+    """number_utils owns digit + word-numeral normalisation for both sides."""
+
+    def test_translates_digits(self):
+        self.assertEqual(normalize_burmese_numerals("၂၅၀၀"), "2500")
+
+    def test_resolves_the_decimal_word(self):
+        self.assertEqual(normalize_burmese_numerals("၁၁၁ ဒသမ ၃၂"), "111.32")
+
+    def test_resolves_word_zero_only_before_a_decimal(self):
+        self.assertEqual(normalize_burmese_numerals("သုည ဒသမ ၁၀"), "0.10")
+        # Not a number phrase — left alone.
+        self.assertEqual(normalize_burmese_numerals("သုည နှင့် ၅"), "သုည နှင့် 5")
+
+    def test_resolves_letter_wa_only_between_digits(self):
+        self.assertEqual(normalize_burmese_numerals("၂ဝ၂၆"), "2026")
+        self.assertEqual(normalize_burmese_numerals("ဝန်ကြီး"), "ဝန်ကြီး")
+
+    def test_handles_empty_input(self):
+        self.assertEqual(normalize_burmese_numerals(""), "")
+        self.assertEqual(normalize_burmese_numerals(None), "")
+
+
 class CollapseGroupedThousandsTests(unittest.TestCase):
     """number_utils is the single source of truth for both sides of the pipeline."""
 
@@ -324,6 +373,10 @@ class WriteReadAgreementTests(unittest.TestCase):
         "2500 ကျပ်",
         "၂၅၀၀၊၂၆၀၀",
         "2500 300",
+        "၁၁၁ ဒသမ ၃၂",
+        "သုည ဒသမ ၁၀",
+        "၂ဝ၂၆",
+        "ဝန်ကြီး ၂၅၀၀",
     )
 
     def test_reader_agrees_with_writer_on_every_sample(self):

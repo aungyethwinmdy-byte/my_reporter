@@ -15,10 +15,9 @@ from google.genai import types
 from supabase import Client
 
 from gemini_config import generate_content_with_fallback, resolve_models
-from number_utils import collapse_grouped_thousands
+from number_utils import collapse_grouped_thousands, normalize_burmese_numerals
 
 logger = logging.getLogger("NumericExtractor")
-BURMESE_DIGIT_MAP = str.maketrans("၀၁၂၃၄၅၆၇၈၉", "0123456789")
 
 
 def clean_number(val_str: str) -> str:
@@ -28,11 +27,11 @@ def clean_number(val_str: str) -> str:
     "မရှိ" ကဲ့သို့ စာသားများ ``newspaper_numbers.value`` ထဲသို့ တိုက်ရိုက်ဝင်သွားသည်။
     ထို column ကို downstream တွင် ``float()`` ဖြင့် ဖတ်သည်။
 
-    Thousands separator အားလုံးကို မဖြုတ်မီ ``number_utils`` မှတစ်ဆင့်
-    ဖြုတ်သည် — "," သာဖြုတ်ပြီး ဘယ်ဘုံးဆုံးဂဏန်းကို ယူခြင်းက "၇၊၁၅၀၊၀၀၀" ကို "7"
-    ဖြစ်စေခဲ့သည် (၇.၁၅ သန်း ကျပ်ဈေး → ၇ ကျပ်)။
+    ဂဏန်းပုံစံ ပြောင်းလဲခြင်းအားလုံးကို ``number_utils`` မှတစ်ဆင့် လုပ်သည် —
+    thousands separator နှင့် မြန်မာစကားလုံးဂဏန်း ("ဒသမ"၊ "သုည"၊ ဝ) နှစ်မျိုးလုံး။
+    ဖတ်တဲ့ဘက် (``report_formatter.clean_number_value``) နှင့် တူညီစေရန်။
     """
-    val = (val_str or "").translate(BURMESE_DIGIT_MAP)
+    val = normalize_burmese_numerals(val_str)
     val = collapse_grouped_thousands(val.replace(",", ""))
     match = re.search(r"[-+]?\d+(?:\.\d+)?", val)
     return match.group(0) if match else ""
