@@ -7,11 +7,14 @@ job budget:
   2. the whole MOI phase is capped by MOI_PHASE_BUDGET.
 """
 
+import os
 import time
 import unittest
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import utils
-from utils import find_moi_paper_universal, get_mdn_backup_papers
+from utils import download_pdf_to_disk, find_moi_paper_universal, get_mdn_backup_papers
 
 
 class FakeFetcher:
@@ -246,6 +249,101 @@ class MdnBackupTests(unittest.TestCase):
     def test_returns_empty_list_when_no_ids_found(self):
         utils._fetch_html = lambda url, timeout, params=None: "<html>no ids</html>"
         self.assertEqual(get_mdn_backup_papers("15", "09", "2026"), [])
+
+
+class _FakeStreamResponse:
+    """Minimal stand-in for `requests.get(..., stream=True)`."""
+
+    def __init__(self, body):
+        self.status_code = 200
+        self._body = body
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, chunk_size=65536):
+        for start in range(0, len(self._body), chunk_size):
+            yield self._body[start : start + chunk_size]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class DownloadVerificationTests(unittest.TestCase):
+    """`download_pdf_to_disk` must reject anything that is not really a PDF.
+
+    The old implementation accepted on size alone (>5 KB). Both government
+    portals serve an HTML maintenance/login page with HTTP 200 when they are
+    down, and that page is bigger than the threshold — so it was saved as
+    ".pdf", uploaded to Drive as application/pdf, and recorded as
+    status="uploaded". `is_uploaded()` then skipped the real issue for the rest
+    of the day and the junk file stayed in the shared folder.
+    """
+
+    def setUp(self):
+        self._real_get = utils.requests.get
+        self.addCleanup(lambda: setattr(utils.requests, "get", self._real_get))
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "issue.pdf")
+
+    def _serve(self, body):
+        utils.requests.get = lambda *a, **k: _FakeStreamResponse(body)
+
+    def test_html_maintenance_page_is_rejected(self):
+        # HTTP 200, larger than the 5 KB threshold, but not a PDF.
+        self._serve(b"<html><body>" + b"Server maintenance. " * 400 + b"</body></html>")
+        self.assertFalse(download_pdf_to_disk("https://www.moi.gov.mm/x.pdf", self.path))
+
+    def test_rejected_response_leaves_no_junk_file_behind(self):
+        self._serve(b"<html><body>" + b"Server maintenance. " * 400 + b"</body></html>")
+        download_pdf_to_disk("https://www.moi.gov.mm/x.pdf", self.path)
+        self.assertFalse(
+            os.path.exists(self.path),
+            "a non-PDF response must not be left on disk for upload",
+        )
+
+    def test_login_redirect_body_is_rejected(self):
+        self._serve(b'{"error":"unauthorized","detail":"' + b"x" * 6000 + b'"}')
+        self.assertFalse(download_pdf_to_disk("https://www.mdn.gov.mm/y.pdf", self.path))
+
+    def test_real_pdf_is_accepted(self):
+        self._serve(b"%PDF-1.7\n" + b"0" * 8000 + b"\n%%EOF")
+        self.assertTrue(download_pdf_to_disk("https://www.moi.gov.mm/x.pdf", self.path))
+        self.assertTrue(os.path.exists(self.path))
+
+    def test_leading_bom_and_newline_are_tolerated(self):
+        # Some servers emit a BOM or a stray newline before the header.
+        self._serve(b"\xef\xbb\xbf\n%PDF-1.7\n" + b"0" * 8000)
+        self.assertTrue(download_pdf_to_disk("https://www.moi.gov.mm/x.pdf", self.path))
+
+    def test_truncated_pdf_is_rejected(self):
+        self._serve(b"%PDF-1.7\nshort")
+        self.assertFalse(download_pdf_to_disk("https://www.moi.gov.mm/x.pdf", self.path))
+
+    def test_network_error_returns_false_and_cleans_up(self):
+        def boom(*a, **k):
+            raise ConnectionError("connection reset")
+
+        utils.requests.get = boom
+        self.assertFalse(download_pdf_to_disk("https://www.moi.gov.mm/x.pdf", self.path))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_is_valid_pdf_is_actually_used_by_the_downloader(self):
+        """Guards the wiring, not just the helper.
+
+        `is_valid_pdf` existed and was unit-tested but nothing called it, which
+        is precisely how the size-only check shipped. Patch it out and the
+        downloader must change behaviour.
+        """
+        self._serve(b"%PDF-1.7\n" + b"0" * 8000)
+        with patch.object(utils, "is_valid_pdf", return_value=False):
+            self.assertFalse(
+                download_pdf_to_disk("https://www.moi.gov.mm/x.pdf", self.path)
+            )
 
 
 if __name__ == "__main__":

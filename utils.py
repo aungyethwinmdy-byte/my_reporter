@@ -381,18 +381,73 @@ def get_mdn_backup_papers(day, month, year):
     return []
 
 
+# How much of the response to sniff when checking for the PDF header.
+_PDF_SNIFF_BYTES = 1024
+
+
+def _looks_like_pdf(head: bytes) -> bool:
+    """True when the start of a response really is a PDF.
+
+    ``%PDF-`` is required to be the first line, but some servers prepend a stray
+    newline or a UTF-8 BOM, so peel those off before delegating to
+    ``is_valid_pdf``. Whitespace is stripped on both sides of the BOM because
+    servers emit them in either order.
+    """
+    _WS = b"\r\n\t "
+    head = head.lstrip(_WS)
+    if head.startswith(b"\xef\xbb\xbf"):
+        head = head[3:].lstrip(_WS)
+    return is_valid_pdf(head)
+
+
 def download_pdf_to_disk(url, local_path):
-    """PDF ဖိုင်ကို Stream ဖြင့် ဒေါင်းလုဒ်ဆွဲပြီး Header စစ်ဆေးခြင်း"""
+    """PDF ဖိုင်ကို Stream ဖြင့် ဒေါင်းလုဒ်ဆွဲပြီး Header စစ်ဆေးခြင်း
+
+    The size check alone is NOT verification. Both government portals answer
+    HTTP 200 with an HTML maintenance or login page when they are down, and such
+    a page is far larger than the old 5 KB threshold. It used to be written out
+    as a ".pdf", uploaded to Drive as application/pdf, and recorded with
+    status="uploaded" — after which ``is_uploaded()`` skipped the real issue for
+    the rest of that day and the junk file stayed in the shared folder. So sniff
+    the ``%PDF-`` signature as well, and delete the file when it is not a PDF.
+    """
     try:
         with requests.get(
             url, headers=HEADERS, stream=True, timeout=(20, 180), verify=VERIFY_TLS
         ) as r:
             r.raise_for_status()
+            head = b""
             with open(local_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
-        return os.path.exists(local_path) and os.path.getsize(local_path) > 5000
+                    if not chunk:
+                        continue
+                    if len(head) < _PDF_SNIFF_BYTES:
+                        head += chunk[: _PDF_SNIFF_BYTES - len(head)]
+                    f.write(chunk)
+
+        if not os.path.exists(local_path):
+            print("❌ Download error: response produced no file")
+            return False
+
+        if not _looks_like_pdf(head):
+            print(f"❌ Download error: not a PDF (starts with {head[:24]!r})")
+            _remove_quietly(local_path)
+            return False
+
+        if os.path.getsize(local_path) <= 5000:
+            print(f"❌ Download error: PDF truncated ({os.path.getsize(local_path)} bytes)")
+            _remove_quietly(local_path)
+            return False
+        return True
     except Exception as e:
         print(f"❌ Download error: {e}")
+        _remove_quietly(local_path)
         return False
+
+
+def _remove_quietly(path):
+    """Best-effort delete; a leftover temp file must never mask the real error."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
