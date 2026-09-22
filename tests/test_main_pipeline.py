@@ -11,6 +11,7 @@ ONE newspaper. It had no coverage, which is how two silent-failure bugs hid ther
 Everything here is offline: network, Drive, SQLite and ingest are all patched.
 """
 
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -23,6 +24,40 @@ import main
 
 def _download_date():
     return date(2026, 9, 18)
+
+
+class _RecordingDrive:
+    """Minimal Drive stub that records the query AND evaluates it.
+
+    A stub that always answered "found" would hide the defect this class exists
+    to catch: the *query string* is what was wrong, and a MagicMock (or a fixed
+    response) accepts any argument at all. So `list()` records the `q` and
+    `execute()` applies Drive's `name contains '<value>'` semantics for real —
+    which is what makes the skip test below a genuine regression test rather
+    than a restatement of the stub.
+    """
+
+    _CONTAINS = re.compile(r"name contains '([^']*)'")
+
+    def __init__(self, existing=()):
+        self.queries = []
+        self._existing = list(existing)
+        self._last_query = None
+
+    def files(self):
+        return self
+
+    def list(self, q=None, fields=None):
+        self.queries.append(q)
+        self._last_query = q
+        return self
+
+    def execute(self):
+        match = self._CONTAINS.search(self._last_query or "")
+        if not match:
+            return {"files": []}
+        fragment = match.group(1)
+        return {"files": [f for f in self._existing if fragment in f["name"]]}
 
 
 class ProcessNewspaperHarness(unittest.TestCase):
@@ -268,6 +303,134 @@ class DatabaseConnectionBindingTests(unittest.TestCase):
             f"bare DB_CONNECTION assignment in __main__ at line(s) {offenders}; "
             "use set_database_connection() instead",
         )
+
+
+class DriveDuplicateLookupTests(ProcessNewspaperHarness):
+    """The Drive duplicate guard must search for a name the pipeline uploads.
+
+    ``file_exists_in_gdrive`` was called with ``file_id``
+    (``myanmaalinn_18_09_2026``) while the Drive file is named
+    ``18-Sep-2026_myanmaalinn.pdf`` — different separators (``-`` vs ``_``) and
+    reversed field order — so ``name contains`` could never match and the guard
+    was dead code from the start. Every pre-existing test patched the helper
+    out, which is exactly why the wrong argument went unnoticed: a MagicMock
+    accepts any argument. These tests drive the real call site and inspect the
+    query string that reaches Drive.
+    """
+
+    def _run(self, drive):
+        with patch.object(
+            main, "upload_to_gdrive",
+            return_value="https://drive.google.com/file/d/x/view",
+        ):
+            return main.process_newspaper(
+                drive, "folder", "မြန်မာ့အလင်း", "mal", "myanmaalinn",
+                "https://www.moi.gov.mm", _download_date(),
+            )
+
+    def test_query_searches_for_the_uploaded_file_name(self):
+        drive = _RecordingDrive()
+        with patch.object(main, "process_and_ingest_pdf", return_value=True):
+            self._run(drive)
+
+        self.assertEqual(len(drive.queries), 1)
+        query = drive.queries[0]
+        self.assertIn(
+            "18-Sep-2026_myanmaalinn", query,
+            "the lookup must be able to match the name upload_to_gdrive() sets",
+        )
+        self.assertNotIn(
+            "myanmaalinn_18_09_2026", query,
+            "the history key appears in no Drive file name — it can never match",
+        )
+
+    def test_existing_drive_copy_is_skipped_without_downloading(self):
+        drive = _RecordingDrive(
+            existing=[{"id": "x", "name": "18-Sep-2026_myanmaalinn.pdf"}]
+        )
+        uploads, error = self._run(drive)
+
+        self.assertEqual(uploads, [], "a Drive duplicate must not be re-uploaded")
+        self.assertIsNone(error)
+        self.assertFalse(
+            main.download_pdf_to_disk.called,
+            "the duplicate check must run before the download",
+        )
+        status, err, _ = self._rows()[0]
+        self.assertEqual(status, "skipped")
+        self.assertIn("Google Drive", err)
+
+    def test_no_match_still_downloads_and_uploads(self):
+        drive = _RecordingDrive()
+        with patch.object(main, "process_and_ingest_pdf", return_value=True):
+            uploads, error = self._run(drive)
+        self.assertEqual(len(uploads), 1)
+        self.assertIsNone(error)
+        self.assertEqual(self._rows()[0][0], "uploaded")
+
+
+class DriveQueryLiteralTests(unittest.TestCase):
+    """Drive's ``q`` has no parameter binding, so unsafe values must be refused."""
+
+    def test_quotes_a_plain_value(self):
+        self.assertEqual(
+            main._drive_query_literal("mal_18_09_2026"), "'mal_18_09_2026'"
+        )
+
+    def test_refuses_values_that_would_break_out_of_the_literal(self):
+        for unsafe in ("a'b", "a\\b", "", None):
+            with self.subTest(value=unsafe):
+                self.assertIsNone(main._drive_query_literal(unsafe))
+
+    def test_lookup_refuses_an_unsafe_name_without_querying_drive(self):
+        drive = _RecordingDrive()
+        self.assertFalse(
+            main.file_exists_in_gdrive(drive, "folder", "18-Sep-2026_' or '1'='1")
+        )
+        self.assertEqual(drive.queries, [], "no query may be sent for an unsafe value")
+
+    def test_lookup_without_a_service_is_false(self):
+        self.assertFalse(main.file_exists_in_gdrive(None, "folder", "anything"))
+
+
+class RunNotificationTests(unittest.TestCase):
+    """A partial failure must not be reported as a clean success.
+
+    The ``__main__`` dispatch tested ``uploads`` first and reached the error
+    branch only when nothing had succeeded at all, so a run where
+    မြန်မာ့အလင်း uploaded and ကြေးမုံ failed sent the ✅ success message and never
+    named the missing paper — the operator had to read the logs to find out.
+    """
+
+    def _notify(self, uploads, failures):
+        sent = []
+        with patch.object(
+            main,
+            "send_telegram_message",
+            side_effect=lambda message, buttons=None: sent.append(message),
+        ):
+            returned = main.notify_run_result("18-Sep-2026", uploads, failures, {})
+        self.assertEqual(len(sent), 1, "exactly one summary per run")
+        self.assertEqual(sent[0], returned, "must return what it sent")
+        return returned
+
+    def test_partial_failure_is_named_in_the_success_message(self):
+        message = self._notify(
+            [("18-Sep-2026_myanmaalinn.pdf", "https://drive.google.com/file/d/x/view")],
+            [("ကြေးမုံ", "ကြေးမုံ အတွက် PDF ရှာမတွေ့ပါ")],
+        )
+        self.assertIn("အောင်မြင်စွာ", message, "the good news is still reported")
+        self.assertIn("18-Sep-2026_myanmaalinn.pdf", message)
+        self.assertIn("ကြေးမုံ", message, "the failed newspaper must be named")
+        self.assertIn("PDF ရှာမတွေ့ပါ", message)
+
+    def test_total_failure_uses_the_error_notification(self):
+        message = self._notify([], [("မြန်မာ့အလင်း", "boom")])
+        self.assertIn("သတိပေးချက်ရှိပါသည်", message)
+
+    def test_no_uploads_and_no_failures_is_idle(self):
+        message = self._notify([], [])
+        self.assertIn("အသစ်တင်ရန် မရှိသေးပါ", message)
 
 
 if __name__ == "__main__":

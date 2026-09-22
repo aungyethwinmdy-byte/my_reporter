@@ -31,6 +31,29 @@ def _short_error(error: BaseException, limit: int = 120) -> str:
 # it is deliberately opt-in and logged so it cannot become the quiet default.
 from env_config import get_bool as _get_bool
 
+# Load .env HERE instead of trusting the importer. VERIFY_TLS is computed at
+# import time, so whichever module imports utils first decides its value — and
+# main.py imports utils on an earlier line than ingest_engine, which used to be
+# the only module calling load_dotenv(). A NEWSROOM_INSECURE_TLS=1 set in .env
+# was therefore silently ignored by the whole download pipeline: the flag that
+# exists to get past a broken TLS proxy did nothing, with no warning. Measured
+# before this fix, from the repo root with NEWSROOM_INSECURE_TLS=1 in .env:
+#
+#   python -c "import main, utils; print(utils.VERIFY_TLS)"        -> True
+#   python -c "import ingest_engine, utils; print(...)"            -> False
+#   NEWSROOM_INSECURE_TLS=1 python -c "import main, utils; ..."    -> False
+#
+# The shell-set case working is what pinned the cause to import order rather
+# than to env_config. Loading it here makes the value independent of the
+# importer's import order.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    # Optional: on CI the values come from the environment directly.
+    pass
+
 VERIFY_TLS = not _get_bool("NEWSROOM_INSECURE_TLS", False)
 
 if not VERIFY_TLS:
