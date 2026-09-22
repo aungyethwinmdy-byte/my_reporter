@@ -121,11 +121,22 @@ def calculate_hash(text: str) -> str:
 
 
 def parse_published_date(entry: dict) -> str:
-    """RSS published date မှ YYYY-MM-DD ပြောင်းလဲခြင်း"""
+    """RSS published date မှ YYYY-MM-DD (မြန်မာစံတော်ချိန်) ပြောင်းလဲခြင်း
+
+    ``parsedate_to_datetime`` keeps the feed's own offset, which is almost always
+    GMT, and formatting that directly stores the *UTC* date. Myanmar is UTC+6:30,
+    so anything published after 17:30 UTC is already the next day locally — a
+    quarter of the clock landed on the wrong date. Those articles were then
+    excluded from a today-scoped ``/compare`` or daily briefing, and the RSS path
+    disagreed with the Telegram path, which already converted (see below).
+    """
     if "published" in entry:
         try:
             dt = parsedate_to_datetime(entry["published"])
-            return dt.strftime("%Y-%m-%d")
+            if dt.tzinfo is None:
+                # A feed that omits the zone; RFC 822 treats that as GMT.
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(MYANMAR_TZ).strftime("%Y-%m-%d")
         except Exception:
             pass
     return datetime.now(MYANMAR_TZ).strftime("%Y-%m-%d")

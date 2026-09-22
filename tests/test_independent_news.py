@@ -17,6 +17,7 @@ No network, no Supabase, no credentials.
 import hashlib
 import unittest
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from unittest.mock import MagicMock, patch
 
 import fetch_independent_news as fin
@@ -104,6 +105,53 @@ class ParsePublishedDateTests(unittest.TestCase):
         self.assertEqual(
             fin.parse_published_date({"published": "Sat, 20 Sep 2026 04:00:00 GMT"}),
             "2026-09-20",
+        )
+
+    def test_late_utc_posts_roll_over_to_the_next_myanmar_day(self):
+        """Myanmar is UTC+6:30, so 20:00 GMT is already tomorrow locally.
+
+        Storing the raw UTC date put every post in the 17:30-23:59 UTC window on
+        the wrong day — about a quarter of the clock — which silently excluded
+        those articles from a today-scoped /compare or daily briefing.
+        """
+        self.assertEqual(
+            fin.parse_published_date({"published": "Mon, 21 Sep 2026 20:00:00 GMT"}),
+            "2026-09-22",
+        )
+        self.assertEqual(
+            fin.parse_published_date({"published": "Mon, 21 Sep 2026 23:59:00 GMT"}),
+            "2026-09-22",
+        )
+
+    def test_the_myanmar_day_boundary_is_17_30_utc(self):
+        self.assertEqual(
+            fin.parse_published_date({"published": "Mon, 21 Sep 2026 17:29:00 GMT"}),
+            "2026-09-21",
+        )
+        self.assertEqual(
+            fin.parse_published_date({"published": "Mon, 21 Sep 2026 17:31:00 GMT"}),
+            "2026-09-22",
+        )
+
+    def test_matches_the_telegram_paths_conversion(self):
+        """Both ingestion paths must agree on which day an article belongs to."""
+        raw = "Mon, 21 Sep 2026 20:00:00 GMT"
+        expected = (
+            parsedate_to_datetime(raw).astimezone(fin.MYANMAR_TZ).strftime("%Y-%m-%d")
+        )
+        self.assertEqual(fin.parse_published_date({"published": raw}), expected)
+
+    def test_non_gmt_offsets_are_converted_not_assumed(self):
+        # 20:00 in a UTC-4 feed is 00:00 UTC the next day, then 06:30 MMT.
+        self.assertEqual(
+            fin.parse_published_date({"published": "Mon, 21 Sep 2026 20:00:00 -0400"}),
+            "2026-09-22",
+        )
+
+    def test_a_feed_without_a_zone_is_treated_as_utc(self):
+        self.assertEqual(
+            fin.parse_published_date({"published": "Mon, 21 Sep 2026 20:00:00"}),
+            "2026-09-22",
         )
 
     def test_falls_back_to_today_on_garbage(self):
