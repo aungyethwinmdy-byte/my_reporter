@@ -141,8 +141,25 @@ def _call_rpc(function: str, params: dict, limit=None) -> str:
 
 
 def create_server():
-    """Build the MCP server. Imported lazily so `mcp`/`uvicorn` are optional."""
-    from mcp.server.fastmcp import FastMCP
+    """Build the MCP server. Imported lazily so `mcp`/`uvicorn` are optional.
+
+    Requires mcp 1.x. `requirements.txt` pins ``mcp<2``; if that pin is lost, a
+    fresh install pulls 2.x, where FastMCP was renamed to MCPServer and
+    ``mcp.server.fastmcp`` is a stub that raises. Say so plainly instead of
+    letting the stub's message through, so the fix is obvious from the traceback.
+    """
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ModuleNotFoundError as error:
+        if "fastmcp" in str(error):
+            raise RuntimeError(
+                "newsroom_mcp requires mcp 1.x, but mcp 2.x is installed. "
+                "In mcp 2 FastMCP was renamed to MCPServer "
+                "(mcp.server.mcpserver). Install the pinned version with "
+                "`pip install -r requirements.txt` (mcp<2), or port this module "
+                "to MCPServer — its .tool()/.run(transport='sse') API differs."
+            ) from error
+        raise
 
     mcp = FastMCP("Myanmar Intelligent Newsroom")
 

@@ -301,5 +301,91 @@ class ErrorHandlingTests(unittest.TestCase):
         self.assertIn("error", payload)
 
 
+class McpVersionTests(unittest.TestCase):
+    """`mcp` must stay pinned below 2.
+
+    `requirements.txt` listed a bare `mcp`. CI installs the latest, and mcp 2.x
+    removed `mcp.server.fastmcp` — FastMCP was renamed to MCPServer. The shim
+    left at that path raises ModuleNotFoundError on import, so `create_server()`
+    could not run at all on a fresh CI runner, and nothing caught it because
+    `mcp` is not installed locally (the tests inject a fake instead).
+    """
+
+    def test_requirements_pins_mcp_below_two(self):
+        requirements = (
+            Path(newsroom_mcp.__file__).resolve().parent / "requirements.txt"
+        ).read_text(encoding="utf-8")
+        specifiers = [
+            line.strip()
+            for line in requirements.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        mcp_specs = [s for s in specifiers if s.split("<")[0].split(">")[0] == "mcp"]
+        self.assertEqual(
+            mcp_specs,
+            ["mcp<2"],
+            f"mcp must be pinned below 2 (found: {mcp_specs}); mcp 2 removed "
+            "mcp.server.fastmcp, which create_server() imports",
+        )
+
+    def test_mcp2_stub_raises_an_actionable_error(self):
+        """Simulate the mcp 2.x stub, which raises on attribute access."""
+
+        class _StubModule(types.ModuleType):
+            def __getattr__(self, name):
+                if name == "FastMCP":
+                    raise ModuleNotFoundError(
+                        "No module named 'mcp.server.fastmcp'. This is mcp 2.x, "
+                        "where FastMCP was renamed to MCPServer",
+                        name="mcp.server.fastmcp",
+                    )
+                raise AttributeError(name)
+
+        stub = _StubModule("mcp.server.fastmcp")
+        server_module = types.ModuleType("mcp.server")
+        server_module.fastmcp = stub
+        top_module = types.ModuleType("mcp")
+        top_module.server = server_module
+
+        with patch.dict(
+            sys.modules,
+            {
+                "mcp": top_module,
+                "mcp.server": server_module,
+                "mcp.server.fastmcp": stub,
+            },
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                newsroom_mcp.create_server()
+
+        message = str(caught.exception)
+        self.assertIn("mcp 1.x", message)
+        self.assertIn("MCPServer", message)
+
+    def test_missing_mcp_entirely_is_left_alone(self):
+        """`mcp` is an optional dependency; its absence must not be rewritten."""
+
+        class _Absent(types.ModuleType):
+            def __getattr__(self, name):
+                raise ModuleNotFoundError("No module named 'mcp'", name="mcp")
+
+        absent = _Absent("mcp.server.fastmcp")
+        server_module = types.ModuleType("mcp.server")
+        server_module.fastmcp = absent
+        top_module = types.ModuleType("mcp")
+        top_module.server = server_module
+
+        with patch.dict(
+            sys.modules,
+            {
+                "mcp": top_module,
+                "mcp.server": server_module,
+                "mcp.server.fastmcp": absent,
+            },
+        ):
+            with self.assertRaises(ModuleNotFoundError):
+                newsroom_mcp.create_server()
+
+
 if __name__ == "__main__":
     unittest.main()
