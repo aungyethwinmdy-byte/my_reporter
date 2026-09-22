@@ -9,7 +9,6 @@ based on a measurement rather than an impression.
 """
 
 import os
-import re
 import sys
 from collections import Counter
 
