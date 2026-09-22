@@ -49,6 +49,29 @@ class SafeJsonExtractTests(unittest.TestCase):
         self.assertEqual(csv_mod.safe_json_extract("not json at all"), [])
         self.assertEqual(csv_mod.safe_json_extract(""), [])
 
+    def test_array_followed_by_prose_containing_brackets(self):
+        """A greedy `\\[.*\\]` spanned to the LAST bracket and lost the array.
+
+        This is the failure that silently downgraded /compare to the
+        whitespace keyword fallback.
+        """
+        text = '["မြဝတီ", "ကုန်သွယ်ရေး"]\nNote: [all keywords are in Myanmar script]'
+        self.assertEqual(csv_mod.safe_json_extract(text), ["မြဝတီ", "ကုန်သွယ်ရေး"])
+
+    def test_two_arrays_returns_the_first(self):
+        text = '["မြဝတီ"]\n["ကုန်သွယ်ရေး"]'
+        self.assertEqual(csv_mod.safe_json_extract(text), ["မြဝတီ"])
+
+    def test_nested_array_still_parses(self):
+        """Greedy is tried first precisely so a nested array is not split."""
+        self.assertEqual(csv_mod.safe_json_extract('[["a"], ["b"]]'), [["a"], ["b"]])
+
+    def test_bracketed_prose_before_the_array_is_skipped(self):
+        text = 'Thinking: [step 1] then [step 2]\n["နယ်စပ်ဂိတ်", "ကုန်သွယ်ရေး"]'
+        self.assertEqual(
+            csv_mod.safe_json_extract(text), ["နယ်စပ်ဂိတ်", "ကုန်သွယ်ရေး"]
+        )
+
 
 class ContextBuilderTests(unittest.TestCase):
     STATE_ARTICLES = [

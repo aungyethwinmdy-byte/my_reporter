@@ -82,15 +82,33 @@ def sanitize_keyword(kw: str) -> str:
 
 
 def safe_json_extract(text: str) -> List[str]:
+    """Best-effort pull of a JSON array out of a model response.
+
+    A greedy ``\\[.*\\]`` spans from the first ``[`` to the LAST ``]``, so a
+    perfectly ordinary reply lost its keywords:
+
+        '["မြဝတီ", "ကုန်သွယ်ရေး"]\\nNote: [all keywords are in Myanmar script]'
+        '["မြဝတီ"]\\n["ကုန်သွယ်ရေး"]'
+
+    both parsed to ``[]``, which silently downgraded the /compare search to the
+    whitespace fallback. Greedy is still tried first because it is the only
+    pattern that handles a nested array; each non-greedy span is then tried in
+    turn.
+    """
+    if not text:
+        return []
+
     try:
         return json.loads(text)
     except Exception:
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        if match:
+        pass
+
+    for pattern in (r"\[.*\]", r"\[.*?\]"):
+        for match in re.finditer(pattern, text, re.DOTALL):
             try:
                 return json.loads(match.group(0))
             except Exception:
-                pass
+                continue
     return []
 
 
