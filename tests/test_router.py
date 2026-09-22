@@ -45,6 +45,48 @@ class RouterClassificationTests(unittest.TestCase):
         self.assertFalse(is_system_meta_query("တောင်ငူ ရေကြီးမှု သတင်း"))
         self.assertFalse(is_system_meta_query(""))
 
+    def test_news_questions_mentioning_media_are_not_system_queries(self):
+        """ROUTE 2 runs before ROUTE 4, so a false positive here costs the answer.
+
+        "မီဒီယာ" (media) and "သတင်းဌာန" (news agency) are ordinary news
+        vocabulary. Matching them on their own replaced these questions with the
+        canned source list, so they never reached the article search.
+        """
+        for query in (
+            "မီဒီယာတွေအပေါ် ဖိအားပေးမှုသတင်း",
+            "နိုင်ငံခြားသတင်းဌာနတွေ ဘာပြောလဲ",
+            "မီဒီယာလွတ်လပ်ခွင့် အခြေအနေ",
+            "သတင်းဌာနတွေမှာ ဖော်ပြထားတဲ့ ရေကြီးမှုသတင်း",
+        ):
+            self.assertFalse(is_system_meta_query(query), query)
+
+    def test_media_word_with_a_counting_form_is_a_system_query(self):
+        self.assertTrue(is_system_meta_query("သတင်းဌာန စာရင်း"))
+        self.assertTrue(is_system_meta_query("source ဘယ်နှခုရှိလဲ"))
+
+    def test_greeting_followed_by_a_question_is_not_a_greeting(self):
+        """"hi ရွှေဈေး" used to be answered with a hello.
+
+        The old rule was `startswith(greeting) and len(query) <= 15`, so a short
+        greeting prefixed onto a short question swallowed the question entirely.
+        """
+        for query in (
+            "hi ရွှေဈေး",
+            "hello စက်သုံးဆီဈေး",
+            "thanks ဒီနေ့သတင်း",
+            "မင်္ဂလာပါ ရေကြီးမှုသတင်း",
+            "မင်္ဂလာရက်",  # a holiday name, not a greeting
+        ):
+            self.assertFalse(is_greeting_or_casual(query), query)
+
+    def test_greeting_with_politeness_still_matches(self):
+        for query in (
+            "မင်္ဂလာပါ", "မင်္ဂလာပါခင်ဗျာ", "hello", "hi", "hi there",
+            "hello everyone", "good morning", "နေကောင်းလား", "ကျေးဇူးတင်ပါတယ်",
+            "မင်္ဂလာပါ!",
+        ):
+            self.assertTrue(is_greeting_or_casual(query), query)
+
     def test_sources_report_total_and_breakdown(self):
         report = get_sources_report()
         self.assertIn("(6)", report)
