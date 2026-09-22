@@ -12,6 +12,9 @@ import os
 import re
 import json
 import logging
+import tempfile
+
+from env_config import get_gemini_api_key, get_supabase_credentials
 
 # Environment Variables Loading
 try:
@@ -50,15 +53,10 @@ logging.basicConfig(
 logger = logging.getLogger("IngestionPipeline")
 
 # Configuration
-# NOTE: env only — a hardcoded fallback silently points ingestion at the
-# wrong Supabase project.
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = (
-    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    or os.environ.get("SUPABASE_KEY")
-    or os.environ.get("SUPABASE_ANON_KEY")
-)
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# NOTE: env only — hardcoded fallbacks silently point ingestion at the wrong
+# Supabase project. Resolution lives in env_config so all five callers agree.
+SUPABASE_URL, SUPABASE_KEY = get_supabase_credentials()
+GEMINI_API_KEY = get_gemini_api_key()
 
 # Initialize Supabase
 supabase: Client = None
@@ -97,6 +95,7 @@ __all__ = [
     "extract_numbers_into_db",
     "extract_page2_tables",
     "insert_article_to_supabase",
+    "build_page_subset_pdf",
 ]
 
 
@@ -143,7 +142,15 @@ def extract_numbers_into_db(headline: str, body_text: str, pub_date: str, sectio
         if items and isinstance(items, list):
             rows = []
             for it in items:
+                if not isinstance(it, dict):
+                    continue
                 v = clean_number(str(it.get("value", "")))
+                if not v:
+                    # ဂဏန်းမထွက်ပါက newspaper_numbers.value ထဲ စာသား မထည့်ပါ။
+                    # (auto_numeric_extractor နှင့် တူညီသော မူဝါဒ — the reader
+                    # parses this column as a number, so a text value is a
+                    # broken row rather than a usable fallback.)
+                    continue
                 rows.append({
                     "publication_date": pub_date,
                     "headline": headline,
@@ -175,6 +182,12 @@ def extract_page2_tables(pdf_path: str) -> list[dict]:
             for t in tables:
                 rows = [" | ".join([str(c).strip() for c in r if c]) for r in t if r]
                 full = "\n".join(rows)
+                # Two independent checks, NOT if/elif. The real page-2 box holds
+                # the gold rate and the fuel prices in the *same* table (its own
+                # headline is "…ဓာတ်သတ္တု(ရွှေ)၊ စက်သုံးဆီ နှင့် နိုင်ငံခြားငွေလဲ…"),
+                # so an `elif` meant the fuel branch always won and the gold row
+                # was never emitted. Live evidence: `newspaper_numbers` has 0 rows
+                # with section='ရွှေ' while the branch has existed all along.
                 if any(k in full for k in ["စက်သုံးဆီ", "ရည်ညွှန်းလက်ကား", "Octane", "Diesel", "ဒီဇယ်"]):
                     results.append({
                         "headline": "ရန်ကုန်မြို့နှင့် မန္တလေးမြို့တို့အတွက် ရည်ညွှန်းလက်ကားဈေးနှုန်းများ",
@@ -182,16 +195,100 @@ def extract_page2_tables(pdf_path: str) -> list[dict]:
                         "page_no": 2,
                         "section": "စက်သုံးဆီ",
                     })
-                elif "ရွှေ" in full and "ရည်ညွှန်း" in full:
+                if "ရွှေ" in full and "ရည်ညွှန်း" in full:
                     results.append({
                         "headline": "ဓာတ်သတ္တု(ရွှေ)ရည်ညွှန်းဈေးသတ်မှတ်ရေးကော်မတီ ရည်ညွှန်းဈေး",
                         "body_text": full,
                         "page_no": 2,
                         "section": "ရွှေ",
                     })
+            if not results:
+                # This used to fail completely silently. It is worth shouting
+                # about, because a paper whose page-2 fonts have no Unicode
+                # mapping produces mangled keywords that no string match can
+                # find — measured on the live 13 Sep 2026 ကြေးမုံ: the gold box
+                # reads "ေရ(cid:619)" for "ရွှေ" and "ရည်\ue101(cid:623) န်း" for
+                # "ရည်ညွှန်း", and the fuel box is not detected as a table at
+                # all, so this function returns [] for *both* newspapers.
+                logger.warning(
+                    "⚠️ Page 2 of %s yielded no fuel/gold table (%d table(s) "
+                    "found). The price rows will be missing; the page must be "
+                    "read by the vision pass instead.",
+                    os.path.basename(str(pdf_path)), len(tables),
+                )
     except Exception as e:
         logger.warning("Page 2 table extraction warning: %s", e)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Text-layer quality
+# ---------------------------------------------------------------------------
+# Some newspaper PDFs embed fonts that carry no /ToUnicode CMap, so their "text
+# layer" is really a run of *glyph indices* rather than Unicode. Every engine
+# exposes that differently — all three strings below were captured from the
+# live moi.gov.mm မြန်မာ့အလင်း issue of 13 Sep 2026:
+#
+#   pypdf       "/g194/g196/g201/g201/g3/g3"         (glyph *names*)
+#   PyMuPDF     "\x02\x03\x04\x04\x05\x05\x06\x07"   (raw glyph ids as control bytes)
+#   pdfplumber  "(cid:5)3(cid:30)(cid:21)(cid:15)"    (CID codes)
+#
+# None of these is blank, so the old `any(t[1].strip() ...)` acceptance test
+# took them for real text: the garbage was handed to Gemini as if it were
+# Burmese, and because the page counted as a *text* page the vision pass never
+# saw it either. That is how 384 rows — 9% of the stored corpus, and 58% of
+# every မြန်မာ့အလင်း row — ended up holding "/g167/g136/g3/..." instead of news.
+_GLYPH_NAME_RE = re.compile(r"/g\d+")
+_CID_CODE_RE = re.compile(r"\(cid:\d+\)")
+# Any Unicode letter (Latin, Burmese, ...) means the layer decoded properly.
+# \w covers letters, digits and "_", so [^\W\d_] is exactly "a letter".
+_LETTER_RE = re.compile(r"[^\W\d_]")
+# C0 controls other than \t \n \r — where raw glyph ids land.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# Thresholds, both measured on the live PDFs (scripts/probe_artefact_ratio.py,
+# 32 pages each, all three engines):
+#
+#                         broken မြန်မာ့အလင်း      clean ကြေးမုံ
+#   artefact ratio       0.550 – 0.992          0.000 – 0.093
+#   letter ratio         0.000 – 0.080          0.326 – 0.408
+#
+# 0.30 sits 3.2x above the worst clean page and 1.8x below the best broken one.
+# The letter ratio is a second, independent veto: no page that is even 20%
+# letters can be mistaken for glyph noise, whatever else it contains.
+_ARTEFACT_RATIO = 0.30
+_LETTER_RATIO = 0.20
+
+
+def looks_like_glyph_noise(text):
+    """စာသား မဟုတ်ဘဲ font glyph code များ ဖြစ်နေပါက True ပြန်ပေးခြင်း။
+
+    True when `text` is a PDF text layer of glyph indices rather than text.
+
+    A page is only called noise when machine artefacts dominate *and* real
+    letters are scarce — a page that is merely numeric, or that carries a few
+    stray ``(cid:N)`` codes for special symbols, keeps its text.
+    """
+    if not text or not text.strip():
+        return False
+
+    stripped = _CID_CODE_RE.sub("", _GLYPH_NAME_RE.sub("", text))
+    artefacts = len(text) - len(stripped) + len(_CONTROL_RE.findall(stripped))
+    if artefacts / len(text) < _ARTEFACT_RATIO:
+        return False
+
+    # Plenty of real letters means the layer decoded, whatever else is in it.
+    return len(_LETTER_RE.findall(stripped)) / len(text) < _LETTER_RATIO
+
+
+def is_usable_page_text(text):
+    """စာမျက်နှာတစ်ခု၏ text layer သည် အသုံးပြုနိုင်ပါက True ပြန်ပေးခြင်း။
+
+    A page may take part in the text pass only if its text layer decoded into
+    real characters. Pages that fail this go to the Gemini vision pass instead,
+    which reads the rendered page image and therefore does not care that the
+    embedded font has no Unicode mapping.
+    """
+    return bool(text and text.strip()) and not looks_like_glyph_noise(text)
 
 
 def extract_text_from_pdf(pdf_path):
@@ -205,7 +302,7 @@ def extract_text_from_pdf(pdf_path):
         for idx, page in enumerate(reader.pages):
             txt = page.extract_text() or ""
             pages_text.append((idx + 1, txt))
-        if any(t[1].strip() for t in pages_text):
+        if any(is_usable_page_text(t) for _, t in pages_text):
             return pages_text
     except Exception:
         pass
@@ -217,7 +314,7 @@ def extract_text_from_pdf(pdf_path):
         pages_text = []
         for idx, page in enumerate(doc):
             pages_text.append((idx + 1, page.get_text()))
-        if any(t[1].strip() for t in pages_text):
+        if any(is_usable_page_text(t) for _, t in pages_text):
             return pages_text
     except Exception:
         pass
@@ -230,14 +327,15 @@ def extract_text_from_pdf(pdf_path):
                 for idx, page in enumerate(pdf.pages):
                     txt = page.extract_text() or ""
                     pages_text.append((idx + 1, txt))
-                if any(t[1].strip() for t in pages_text):
+                if any(is_usable_page_text(t) for _, t in pages_text):
                     return pages_text
         except Exception:
             pass
 
     logger.warning(
-        "⚠️ pypdf/PyMuPDF/pdfplumber ဖြင့် စာသား ထုတ်ယူ၍ မရပါ "
-        "(library မရှိခြင်း သို့မဟုတ် scanned PDF ဖြစ်ခြင်း)။ "
+        "⚠️ pypdf/PyMuPDF/pdfplumber ဖြင့် အသုံးပြုနိုင်သော စာသား ထုတ်ယူ၍ မရပါ "
+        "(library မရှိခြင်း၊ scanned PDF ဖြစ်ခြင်း သို့မဟုတ် font များတွင် "
+        "Unicode mapping မရှိခြင်း)။ "
         "Gemini Native PDF Vision သို့ ပြောင်းပါမည်。"
     )
     return pages_text
@@ -293,6 +391,19 @@ def parse_articles_with_gemini_text(page_no, page_text, newspaper_name, issue_da
     if not gemini_client or not page_text.strip():
         return []
 
+    # Last gate before rows reach Supabase. Handing a glyph-encoded page to the
+    # model does not fail loudly — it happily echoes "/g194/g196/g201" back as
+    # the headline and body, and those rows then pollute retrieval and inflate
+    # /status counts. The caller already routes such pages to vision; this keeps
+    # the guarantee even if a future caller forgets.
+    if looks_like_glyph_noise(page_text):
+        logger.warning(
+            "⚠️ Page %s of %s has a glyph-encoded text layer (no Unicode "
+            "mapping); skipping the text pass — the vision pass must read it.",
+            page_no, newspaper_name,
+        )
+        return []
+
     prompt = f"""
 Extract all Myanmar news articles from "{newspaper_name}" published on {issue_date} (Page {page_no}).
 
@@ -317,6 +428,45 @@ Return strictly JSON array:
         return []
 
 
+def build_page_subset_pdf(pdf_path, page_numbers):
+    """Copy just ``page_numbers`` (1-based) into a temporary PDF.
+
+    Returns the temp path, or None when the subset cannot be built — the caller
+    then falls back to the original file rather than losing the vision pass.
+    """
+    if not page_numbers:
+        return None
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except Exception as err:  # pypdf is optional at import time
+        logger.warning("⚠️ pypdf unavailable, cannot subset pages: %s", err)
+        return None
+
+    temp_path = None
+    try:
+        reader = PdfReader(pdf_path)
+        writer = PdfWriter()
+        for page_no in page_numbers:
+            index = int(page_no) - 1
+            if 0 <= index < len(reader.pages):
+                writer.add_page(reader.pages[index])
+        if not writer.pages:
+            return None
+        handle, temp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(handle)
+        with open(temp_path, "wb") as out_file:
+            writer.write(out_file)
+        return temp_path
+    except Exception as err:
+        logger.warning("⚠️ Could not build the blank-page subset: %s", err)
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        return None
+
+
 def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):
     """သတင်းစာ PDF တစ်စောင်လုံးကို Ingest ပြုလုပ်သည့် အဓိက လုပ်ဆောင်ချက်"""
     logger.info("🚀 Processing Ingestion: %s (%s) | File: %s", newspaper_name, issue_date, pdf_path)
@@ -326,6 +476,10 @@ def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):
         return False
 
     total_ingested = 0
+    # Headlines already stored during this run. The vision pass re-reads the PDF
+    # and can hand back pages that the text pass already covered, so this keeps a
+    # single issue from inserting the same article twice.
+    ingested_headlines = set()
 
     # 1. Page-2 fuel/gold table boxes via pdfplumber (ingested first)
     p2_tables = extract_page2_tables(pdf_path)
@@ -340,16 +494,30 @@ def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):
         }
         if insert_article_to_supabase(rec):
             total_ingested += 1
+            ingested_headlines.add(rec["headline"].strip())
             extract_numbers_into_db(tbl["headline"], tbl["body_text"], issue_date, sec)
 
     # 2. Extract text from PDF
     pages = extract_text_from_pdf(pdf_path)
 
+    # A newspaper PDF is frequently *partially* scanned: some pages carry an
+    # embedded text layer while others are pure images. The old branch only
+    # asked "did ANY page yield text?" and then handled the whole document in
+    # text mode, silently discarding every image-only page — for these papers
+    # that is often page 2, where the fuel and gold price tables live. Track the
+    # pages that produced nothing and OCR those specifically.
+    #
+    # "Yielded text" has to mean *usable* text. A page whose fonts have no
+    # Unicode mapping yields "/g167/g136/g3/..." — non-blank, and previously
+    # enough to mark the whole issue as text-mode, so the vision pass was
+    # skipped and the glyph codes were stored as news. `is_usable_page_text`
+    # treats those pages as blank, which sends them to vision instead.
+    text_pages = [(n, t) for (n, t) in pages if is_usable_page_text(t)]
+    blank_pages = [n for (n, t) in pages if not is_usable_page_text(t)]
+
     # 3. Standard Text Extraction ရပါက Text Mode သုံးမည်
-    if pages and any(p[1].strip() for p in pages):
-        for page_no, page_text in pages:
-            if not page_text.strip():
-                continue
+    if text_pages:
+        for page_no, page_text in text_pages:
             articles = parse_articles_with_gemini_text(page_no, page_text, newspaper_name, issue_date)
             for art in articles:
                 h = str(art.get("headline", "")).strip()
@@ -364,28 +532,60 @@ def process_and_ingest_pdf(pdf_path, newspaper_name, issue_date):
                     }
                     if insert_article_to_supabase(rec):
                         total_ingested += 1
+                        ingested_headlines.add(h)
                         if any(k in h for k in ["ဈေး", "နှုန်း", "ရင်းနှီးမြှုပ်နှံမှု", "စပါး", "ဘဏ္ဍာ"]):
                             extract_numbers_into_db(h, b, issue_date, "စီးပွားရေး")
 
-    # 4. Text extraction မရပါက (Scanned Image PDF ဖြစ်ပါက) Gemini Native PDF Vision သုံးမည်
-    else:
-        logger.info("📸 Standard Text extraction yielded no text. Switching to Gemini Native PDF Vision for %s...", newspaper_name)
-        articles = parse_articles_with_gemini_native_pdf(pdf_path, newspaper_name, issue_date)
+    # 4. စာသားမရသော စာမျက်နှာများ (Scanned Image Pages) ကို Gemini Native PDF
+    #    Vision ဖြင့် သီးသန့် ဖတ်မည်။ pages လုံးဝမရပါကလည်း ဤနေရာသို့ ရောက်သည်။
+    if blank_pages or not text_pages:
+        logger.info(
+            "📸 %d page(s) yielded no text layer; using Gemini Native PDF Vision for %s...",
+            len(blank_pages), newspaper_name,
+        )
+
+        # Send ONLY the pages that produced no text. Handing over the whole file
+        # made the model re-extract every text page as well, and those articles
+        # had already been inserted above — so each partially-scanned issue
+        # stored its text pages twice. When every page is blank the subset would
+        # be the whole document, so skip the copy; when the subset cannot be
+        # built, fall back to the original rather than losing the price tables.
+        vision_path = None
+        if blank_pages and text_pages:
+            vision_path = build_page_subset_pdf(pdf_path, blank_pages)
+        try:
+            articles = parse_articles_with_gemini_native_pdf(
+                vision_path or pdf_path, newspaper_name, issue_date
+            )
+        finally:
+            if vision_path:
+                try:
+                    os.remove(vision_path)
+                except OSError:
+                    pass
+
         for art in articles:
             h = str(art.get("headline", "")).strip()
             b = str(art.get("body_text", "")).strip()
-            if h and b:
-                rec = {
-                    "newspaper_name": str(newspaper_name),
-                    "issue_date": str(issue_date),
-                    "page_no": int(art.get("page_no") or 1),
-                    "headline": h,
-                    "body_text": b,
-                }
-                if insert_article_to_supabase(rec):
-                    total_ingested += 1
-                    if any(k in h for k in ["ဈေး", "နှုန်း", "ရင်းနှီးမြှုပ်နှံမှု", "စပါး", "ဘဏ္ဍာ"]):
-                        extract_numbers_into_db(h, b, issue_date, "စီးပွားရေး")
+            if not h or not b:
+                continue
+            # Belt and braces: the subset is best-effort, and a model may still
+            # return a text-page article it saw in the fallback file.
+            if h in ingested_headlines:
+                logger.debug("Skipping duplicate headline from vision pass: %s", h[:60])
+                continue
+            rec = {
+                "newspaper_name": str(newspaper_name),
+                "issue_date": str(issue_date),
+                "page_no": int(art.get("page_no") or 1),
+                "headline": h,
+                "body_text": b,
+            }
+            if insert_article_to_supabase(rec):
+                total_ingested += 1
+                ingested_headlines.add(h)
+                if any(k in h for k in ["ဈေး", "နှုန်း", "ရင်းနှီးမြှုပ်နှံမှု", "စပါး", "ဘဏ္ဍာ"]):
+                    extract_numbers_into_db(h, b, issue_date, "စီးပွားရေး")
 
     logger.info("✅ Successful Ingestion: %d articles inserted for %s (%s).", total_ingested, newspaper_name, issue_date)
     return total_ingested > 0

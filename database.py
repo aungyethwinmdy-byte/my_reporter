@@ -36,8 +36,16 @@ def init_database(path):
     db_path = Path(path)
     if db_path.parent != Path("."):
         db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as connection:
+    # `with sqlite3.connect(...)` only commits/rolls back the transaction — it
+    # does NOT close the file handle. The leaked handle keeps the database
+    # locked, which breaks TemporaryDirectory cleanup on Windows (WinError 32)
+    # and leaves a stale lock for the next process. Close it explicitly.
+    connection = sqlite3.connect(db_path)
+    try:
         connection.executescript(SCHEMA)
+        connection.commit()
+    finally:
+        connection.close()
     return str(db_path)
 
 

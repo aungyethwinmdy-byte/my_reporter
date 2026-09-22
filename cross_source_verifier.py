@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
+from env_config import get_gemini_api_key, get_int as _get_int, get_supabase_credentials
 from supabase import create_client, Client
 from google import genai
 from google.genai import types
@@ -31,21 +32,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("CrossSourceVerifier")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = (
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    or os.getenv("SUPABASE_KEY")
-    or os.getenv("SUPABASE_ANON_KEY")
-)
-
+SUPABASE_URL, SUPABASE_KEY = get_supabase_credentials()
 INDEPENDENT_SUPABASE_URL = os.getenv("INDEPENDENT_SUPABASE_URL") or SUPABASE_URL
 INDEPENDENT_SUPABASE_KEY = os.getenv("INDEPENDENT_SUPABASE_KEY") or SUPABASE_KEY
 INDEPENDENT_TABLE_NAME = os.getenv("INDEPENDENT_TABLE_NAME", "independent_articles")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+GEMINI_API_KEY = get_gemini_api_key()
 
 STATE_MEDIA_SOURCES = ["မြန်မာ့အလင်း", "ကြေးမုံ"]
-SEARCH_WINDOW_DAYS = int(os.getenv("SEARCH_WINDOW_DAYS", 14))
+# Never raises on a malformed value (e.g. "14 days" from a workflow secret):
+# env_config logs a warning and falls back to the default.
+SEARCH_WINDOW_DAYS = _get_int("SEARCH_WINDOW_DAYS", 14, minimum=1, maximum=365)
 # Shared model defaults + fallback chain (GEMINI_MODEL / GEMINI_FALLBACK_MODELS).
 GEMINI_MODEL = gemini_config.GEMINI_MODEL
 GEMINI_MODELS = gemini_config.GEMINI_MODELS
@@ -85,15 +82,33 @@ def sanitize_keyword(kw: str) -> str:
 
 
 def safe_json_extract(text: str) -> List[str]:
+    """Best-effort pull of a JSON array out of a model response.
+
+    A greedy ``\\[.*\\]`` spans from the first ``[`` to the LAST ``]``, so a
+    perfectly ordinary reply lost its keywords:
+
+        '["မြဝတီ", "ကုန်သွယ်ရေး"]\\nNote: [all keywords are in Myanmar script]'
+        '["မြဝတီ"]\\n["ကုန်သွယ်ရေး"]'
+
+    both parsed to ``[]``, which silently downgraded the /compare search to the
+    whitespace fallback. Greedy is still tried first because it is the only
+    pattern that handles a nested array; each non-greedy span is then tried in
+    turn.
+    """
+    if not text:
+        return []
+
     try:
         return json.loads(text)
     except Exception:
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        if match:
+        pass
+
+    for pattern in (r"\[.*\]", r"\[.*?\]"):
+        for match in re.finditer(pattern, text, re.DOTALL):
             try:
                 return json.loads(match.group(0))
             except Exception:
-                pass
+                continue
     return []
 
 

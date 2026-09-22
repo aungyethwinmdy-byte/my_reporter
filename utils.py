@@ -1,16 +1,65 @@
 import os
 import re
 import time
+import logging
 import threading
 import requests
-import urllib3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import pytz
 
-# SSL Warning များကို ပိတ်ထားခြင်း
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logger = logging.getLogger("my_reporter.utils")
+
+
+def _short_error(error: BaseException, limit: int = 120) -> str:
+    """One-line, length-capped error text for logs."""
+    text = str(error).replace("\n", " ").strip()
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+# ------------------------------------------------------------
+# TLS verification
+# ------------------------------------------------------------
+# Verification used to be disabled process-wide (verify=False plus a blanket
+# urllib3.disable_warnings call). That silently accepted forged certificates for
+# every request, including the newspaper PDFs that get ingested straight into
+# the newsroom database. Both upstream hosts (moi.gov.mm via Starfield,
+# mdn.gov.mm via Google Trust Services) serve valid public certificates, so
+# verification is ON by default.
+#
+# Set NEWSROOM_INSECURE_TLS=1 only to work around a broken corporate TLS proxy;
+# it is deliberately opt-in and logged so it cannot become the quiet default.
+from env_config import get_bool as _get_bool
+
+# Load .env HERE instead of trusting the importer. VERIFY_TLS is computed at
+# import time, so whichever module imports utils first decides its value — and
+# main.py imports utils on an earlier line than ingest_engine, which used to be
+# the only module calling load_dotenv(). A NEWSROOM_INSECURE_TLS=1 set in .env
+# was therefore silently ignored by the whole download pipeline: the flag that
+# exists to get past a broken TLS proxy did nothing, with no warning. Measured
+# before this fix, from the repo root with NEWSROOM_INSECURE_TLS=1 in .env:
+#
+#   python -c "import main, utils; print(utils.VERIFY_TLS)"        -> True
+#   python -c "import ingest_engine, utils; print(...)"            -> False
+#   NEWSROOM_INSECURE_TLS=1 python -c "import main, utils; ..."    -> False
+#
+# The shell-set case working is what pinned the cause to import order rather
+# than to env_config. Loading it here makes the value independent of the
+# importer's import order.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    # Optional: on CI the values come from the environment directly.
+    pass
+
+VERIFY_TLS = not _get_bool("NEWSROOM_INSECURE_TLS", False)
+
+if not VERIFY_TLS:
+    import urllib3
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # HTTP Request Headers
 HEADERS = {
@@ -47,10 +96,14 @@ MOI_SOURCES = [
 # timeout, then a category page plus one request per matching detail link —
 # twice, once per newspaper. On a slow day that alone could eat the workflow's
 # 15-minute job budget. Probe in parallel and cap each phase with a deadline.
-MOI_SLUG_TIMEOUT = float(os.environ.get("MOI_SLUG_TIMEOUT", "8"))
-MOI_MAX_WORKERS = int(os.environ.get("MOI_MAX_WORKERS", "8"))
-MOI_PHASE_BUDGET = float(os.environ.get("MOI_PHASE_BUDGET", "90"))
-MDN_DATE_TIMEOUT = float(os.environ.get("MDN_DATE_TIMEOUT", "10"))
+from env_config import get_bool as _get_bool, get_float, get_int
+
+# Bounds guard against a typo like MOI_MAX_WORKERS=0 (which would deadlock the
+# probe pool) or MOI_MAX_WORKERS=9999 (which would hammer the government site).
+MOI_SLUG_TIMEOUT = get_float("MOI_SLUG_TIMEOUT", 8.0, minimum=0.5, maximum=120.0)
+MOI_MAX_WORKERS = get_int("MOI_MAX_WORKERS", 8, minimum=1, maximum=64)
+MOI_PHASE_BUDGET = get_float("MOI_PHASE_BUDGET", 90.0, minimum=1.0, maximum=600.0)
+MDN_DATE_TIMEOUT = get_float("MDN_DATE_TIMEOUT", 10.0, minimum=0.5, maximum=120.0)
 
 _thread_local = threading.local()
 
@@ -68,7 +121,9 @@ def _http_session():
 def _fetch_html(url, timeout, params=None):
     """Single GET that returns HTML text or None. Never raises."""
     try:
-        response = _http_session().get(url, params=params, timeout=timeout, verify=False)
+        response = _http_session().get(
+            url, params=params, timeout=timeout, verify=VERIFY_TLS
+        )
         if response.status_code == 200:
             return response.text
     except Exception:
@@ -195,7 +250,10 @@ def _probe_for_pdf_links(urls, base_url, timeout, deadline):
     """
     urls များကို parallel စမ်းပြီး PDF link ပါသော ပထမဆုံး URL ကို ပြန်ပေးသည်။
 
-    deadline (time.monotonic) ကျော်လျှင် ရှာဖွေမှု ရပ်ပြီး None ပြန်ပေးသည်။
+    deadline (time.monotonic) ကျော်လျှင် ရှာဖွေမှု ရပ်ပြီး ရရှိထားသမျှ ပြန်ပေးသည်။
+
+    တစ်ခုချင်းသော probe ကျရှုံးခြင်း (network hiccup) သည် အခြား probe မှ
+    ရှာတွေ့ထားသော ရလဒ်ကို မပျက်စီးစေရ — error ကို log သာ တင်ပြီး ဆက်လုပ်သည်။
     """
     urls = list(dict.fromkeys(urls))
     if not urls or deadline <= time.monotonic():
@@ -208,18 +266,25 @@ def _probe_for_pdf_links(urls, base_url, timeout, deadline):
             for future in as_completed(futures, timeout=max(1.0, deadline - time.monotonic())):
                 if deadline <= time.monotonic():
                     break
-                html = future.result()
+                # Isolate per-probe failures: a single dead endpoint must not
+                # abort the whole search (previously the outer `except Exception`
+                # did exactly that and threw away already-found links).
+                try:
+                    html = future.result()
+                except Exception as probe_error:  # noqa: BLE001
+                    logger.debug(
+                        "Probe failed for %s: %s", futures[future], _short_error(probe_error)
+                    )
+                    continue
                 if not html:
                     continue
                 links = extract_pdf_links(html)
                 if links:
                     found = absolute_url(links[0], base_url)
                     break
-        except Exception:
-            # Budget exhausted (as_completed timeout) — return whatever we have.
-            return found
-        for future in futures:
-            future.cancel()
+        except TimeoutError:
+            # Budget exhausted — return whatever we have so far.
+            logger.debug("MOI probe budget exhausted (%.1fs)", MOI_PHASE_BUDGET)
     return found
 
 
@@ -309,7 +374,17 @@ def get_mdn_backup_papers(day, month, year):
         futures = {executor.submit(_probe, fmt): fmt for fmt in date_formats}
         try:
             for future in as_completed(futures, timeout=MDN_DATE_TIMEOUT + 5):
-                ids = future.result()
+                # A single failing date-format probe must not discard the
+                # results of the others (same isolation as _probe_for_pdf_links).
+                try:
+                    ids = future.result()
+                except Exception as probe_error:  # noqa: BLE001
+                    logger.debug(
+                        "MDN probe failed for %s: %s",
+                        futures[future],
+                        _short_error(probe_error),
+                    )
+                    continue
                 if not ids:
                     continue
                 return [
@@ -320,7 +395,8 @@ def get_mdn_backup_papers(day, month, year):
                     }
                     for i, pid in enumerate(ids)
                 ]
-        except Exception:
+        except TimeoutError:
+            logger.debug("MDN probe budget exhausted")
             return []
         finally:
             for future in futures:
@@ -328,16 +404,73 @@ def get_mdn_backup_papers(day, month, year):
     return []
 
 
+# How much of the response to sniff when checking for the PDF header.
+_PDF_SNIFF_BYTES = 1024
+
+
+def _looks_like_pdf(head: bytes) -> bool:
+    """True when the start of a response really is a PDF.
+
+    ``%PDF-`` is required to be the first line, but some servers prepend a stray
+    newline or a UTF-8 BOM, so peel those off before delegating to
+    ``is_valid_pdf``. Whitespace is stripped on both sides of the BOM because
+    servers emit them in either order.
+    """
+    _WS = b"\r\n\t "
+    head = head.lstrip(_WS)
+    if head.startswith(b"\xef\xbb\xbf"):
+        head = head[3:].lstrip(_WS)
+    return is_valid_pdf(head)
+
+
 def download_pdf_to_disk(url, local_path):
-    """PDF ဖိုင်ကို Stream ဖြင့် ဒေါင်းလုဒ်ဆွဲပြီး Header စစ်ဆေးခြင်း"""
+    """PDF ဖိုင်ကို Stream ဖြင့် ဒေါင်းလုဒ်ဆွဲပြီး Header စစ်ဆေးခြင်း
+
+    The size check alone is NOT verification. Both government portals answer
+    HTTP 200 with an HTML maintenance or login page when they are down, and such
+    a page is far larger than the old 5 KB threshold. It used to be written out
+    as a ".pdf", uploaded to Drive as application/pdf, and recorded with
+    status="uploaded" — after which ``is_uploaded()`` skipped the real issue for
+    the rest of that day and the junk file stayed in the shared folder. So sniff
+    the ``%PDF-`` signature as well, and delete the file when it is not a PDF.
+    """
     try:
-        with requests.get(url, headers=HEADERS, stream=True, timeout=(20, 180), verify=False) as r:
+        with requests.get(
+            url, headers=HEADERS, stream=True, timeout=(20, 180), verify=VERIFY_TLS
+        ) as r:
             r.raise_for_status()
+            head = b""
             with open(local_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
-        return os.path.exists(local_path) and os.path.getsize(local_path) > 5000
+                    if not chunk:
+                        continue
+                    if len(head) < _PDF_SNIFF_BYTES:
+                        head += chunk[: _PDF_SNIFF_BYTES - len(head)]
+                    f.write(chunk)
+
+        if not os.path.exists(local_path):
+            print("❌ Download error: response produced no file")
+            return False
+
+        if not _looks_like_pdf(head):
+            print(f"❌ Download error: not a PDF (starts with {head[:24]!r})")
+            _remove_quietly(local_path)
+            return False
+
+        if os.path.getsize(local_path) <= 5000:
+            print(f"❌ Download error: PDF truncated ({os.path.getsize(local_path)} bytes)")
+            _remove_quietly(local_path)
+            return False
+        return True
     except Exception as e:
         print(f"❌ Download error: {e}")
+        _remove_quietly(local_path)
         return False
+
+
+def _remove_quietly(path):
+    """Best-effort delete; a leftover temp file must never mask the real error."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass

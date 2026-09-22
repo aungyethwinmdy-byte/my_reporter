@@ -5,11 +5,14 @@ If you rename/move any of these functions, update this file too.
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from telegram_bot import (
     build_precision_numeric_report,
     clean_number_value,
     detect_commodity_context,
+    extract_and_cache_missing_numbers,
     get_myanmar_dates,
     is_numeric_or_price_query,
     normalize_digits,
@@ -41,6 +44,129 @@ class NumericHelperTests(unittest.TestCase):
         self.assertIsNone(clean_number_value(None))
         self.assertIsNone(clean_number_value(""))
         self.assertIsNone(clean_number_value("ဈေးနှုန်း မပါရှိပါ"))
+
+
+class _ScriptedGemini:
+    """Replies with a canned body per call, so the fallback chain is observable."""
+
+    def __init__(self, bodies):
+        self.bodies = list(bodies)
+        self.calls = []
+
+    def generate_content(self, model=None, contents=None, config=None):
+        self.calls.append(model)
+        body = self.bodies[min(len(self.calls) - 1, len(self.bodies) - 1)]
+        return SimpleNamespace(text=body)
+
+
+def _gemini_returning(body):
+    return SimpleNamespace(models=_ScriptedGemini([body]))
+
+
+ARTICLE = {
+    "issue_date": "2026-09-18",
+    "page_no": 2,
+    "headline": "စက်သုံးဆီဈေး",
+    "body_text": "အောက်တိန်း ၉၂ ရည်ညွှန်းဈေး ၃၀၅၀ ကျပ်",
+}
+DATES = ["2026-09-18"]
+
+
+class AutoCacheNumericExtractionTests(unittest.TestCase):
+    """`extract_and_cache_missing_numbers` writes `newspaper_numbers.value`.
+
+    It had no coverage at all, so two defects shipped: a JSON *object* reply
+    stopped the model fallback chain at the first model, and the value was
+    round-tripped through `float`, which turned 3050 into "3050.0" and made the
+    dashboard render a spurious ".၀" on every whole-number price.
+    """
+
+    def test_whole_number_is_stored_without_a_spurious_decimal(self):
+        supa = MagicMock()
+        rows = extract_and_cache_missing_numbers(
+            _gemini_returning('[{"value": "3050", "original_value": "၃,၀၅၀"}]'),
+            supa,
+            [ARTICLE],
+            DATES,
+            "စက်သုံးဆီ",
+        )
+        self.assertEqual(rows[0]["value"], "3050")
+        inserted = supa.from_.return_value.insert.call_args[0][0]
+        self.assertEqual(inserted[0]["value"], "3050")
+
+    def test_trailing_zero_in_a_decimal_is_preserved(self):
+        supa = MagicMock()
+        rows = extract_and_cache_missing_numbers(
+            _gemini_returning('[{"value": "1500.50"}]'), supa, [ARTICLE], DATES, "စက်သုံးဆီ"
+        )
+        self.assertEqual(rows[0]["value"], "1500.50")
+
+    def test_burmese_digits_are_normalized(self):
+        supa = MagicMock()
+        rows = extract_and_cache_missing_numbers(
+            _gemini_returning('[{"value": "၃၀၅၀"}]'), supa, [ARTICLE], DATES, "စက်သုံးဆီ"
+        )
+        self.assertEqual(rows[0]["value"], "3050")
+
+    def test_rows_without_a_number_are_not_inserted(self):
+        """A non-numeric value must not reach a column the reader parses as a number."""
+        supa = MagicMock()
+        rows = extract_and_cache_missing_numbers(
+            _gemini_returning('[{"value": "မရှိ"}, {"value": "N/A"}]'),
+            supa,
+            [ARTICLE],
+            DATES,
+            "စက်သုံးဆီ",
+        )
+        self.assertEqual(rows, [])
+        supa.from_.return_value.insert.assert_not_called()
+
+    def test_object_reply_advances_to_the_next_model(self):
+        """A dict reply must RAISE so the chain moves on instead of giving up.
+
+        `generate_content_with_fallback` only tries the next model when `parse`
+        raises; returning the dict counted as success and the figures were
+        dropped with no retry.
+        """
+        client = SimpleNamespace(
+            models=_ScriptedGemini(['{"prices": [{"value": "3050"}]}', '[{"value": "3050"}]'])
+        )
+        rows = extract_and_cache_missing_numbers(
+            client, MagicMock(), [ARTICLE], DATES, "စက်သုံးဆီ"
+        )
+        self.assertGreater(len(client.models.calls), 1, "second model was never consulted")
+        self.assertEqual(rows[0]["value"], "3050")
+
+    def test_non_dict_entries_are_skipped(self):
+        supa = MagicMock()
+        rows = extract_and_cache_missing_numbers(
+            _gemini_returning('["oops", {"value": "3050"}]'),
+            supa,
+            [ARTICLE],
+            DATES,
+            "စက်သုံးဆီ",
+        )
+        self.assertEqual([r["value"] for r in rows], ["3050"])
+
+    def test_no_matching_article_text_returns_empty(self):
+        supa = MagicMock()
+        rows = extract_and_cache_missing_numbers(
+            _gemini_returning('[{"value": "3050"}]'),
+            supa,
+            [dict(ARTICLE, issue_date="2020-01-01")],
+            DATES,
+            "စက်သုံးဆီ",
+        )
+        self.assertEqual(rows, [])
+        supa.from_.return_value.insert.assert_not_called()
+
+    def test_insert_failure_does_not_raise(self):
+        supa = MagicMock()
+        supa.from_.return_value.insert.return_value.execute.side_effect = RuntimeError("db down")
+        rows = extract_and_cache_missing_numbers(
+            _gemini_returning('[{"value": "3050"}]'), supa, [ARTICLE], DATES, "စက်သုံးဆီ"
+        )
+        self.assertEqual(rows[0]["value"], "3050")
 
 
 class QueryClassificationTests(unittest.TestCase):

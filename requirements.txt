@@ -38,5 +38,10 @@ httpx
 python-dotenv
 
 # ---------- MCP server (newsroom_mcp.py) ----------
-mcp
+# MUST stay <2. mcp 2.x removed `mcp.server.fastmcp` and renamed FastMCP to
+# MCPServer (mcp.server.mcpserver); the shim left behind raises
+# ModuleNotFoundError with a migration pointer, so an unpinned install breaks
+# `python newsroom_mcp.py` outright on a fresh CI runner. Migrating to MCPServer
+# is a separate change — see the note in newsroom_mcp.create_server().
+mcp<2
 uvicorn

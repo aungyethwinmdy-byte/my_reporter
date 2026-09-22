@@ -36,20 +36,56 @@ MONITORED_SOURCES = {
 # 1. GREETING & CASUAL FILTER
 # ============================================================
 
+_GREETINGS = (
+    "မင်္ဂလာပါ", "မင်္ဂလာ", "ဟယ်လို", "hello", "hi", "hey",
+    "နေကောင်းလား", "နေကောင်းရဲ့လား", "ကျေးဇူး", "ကျေးဇူးတင်ပါတယ်",
+    "ကျေးဇူးပါ", "thanks", "thank you", "good morning", "good evening",
+)
+
+# Only these may follow a greeting for the message to still count as a greeting.
+_POLITE_SUFFIXES = (
+    "ခင်ဗျာ", "ခင်ဗျ", "ရှင့်", "ရှင်", "ဗျ", "ပါ", "ရဲ့",
+    "there", "all", "everyone", "again",
+)
+
+def _strip_politeness(text: str) -> str:
+    """Drop trailing politeness words/punctuation so a greeting can be compared.
+
+    "မင်္ဂလာပါခင်ဗျာ" is the same greeting as "မင်္ဂလာပါ", and "hi there" as
+    "hi", so peel the suffixes off before deciding what is left.
+    """
+    text = text.strip()
+    changed = True
+    while changed:
+        changed = False
+        for suffix in _POLITE_SUFFIXES:
+            if text.endswith(suffix) and len(text) > len(suffix):
+                text = text[: -len(suffix)].strip()
+                changed = True
+    return text.strip("!?.,;:~ \t\n\u200b")
+
+
 def is_greeting_or_casual(query: str) -> bool:
-    """မင်္ဂလာပါ၊ ဟယ်လို စသည့် နှုတ်ဆက်စကား သက်သက် ဟုတ်/မဟုတ် စစ်ဆေးခြင်း"""
+    """မင်္ဂလာပါ၊ ဟယ်လို စသည့် နှုတ်ဆက်စကား သက်သက် ဟုတ်/မဟုတ် စစ်ဆေးခြင်း
+
+    The match must consume the whole message, not just its opening word. The
+    old rule was ``startswith(greeting) and len(query) <= 15``, which swallowed
+    real questions that merely opened with a greeting — "hi ရွှေဈေး" (hi + gold
+    price) was answered with a hello and the price question was dropped. A
+    greeting followed by anything but politeness is not a greeting.
+    """
     if not query:
         return False
-    clean_q = query.strip().lower()
+    clean_q = _strip_politeness(query.lower())
+    if not clean_q:
+        return False
 
-    greetings = [
-        "မင်္ဂလာပါ", "မင်္ဂလာ", "ဟယ်လို", "hello", "hi", "hey",
-        "နေကောင်းလား", "နေကောင်းရဲ့လား", "ကျေးဇူး", "ကျေးဇူးတင်ပါတယ်",
-        "ကျေးဇူးပါ", "thanks", "thank you", "good morning", "good evening",
-    ]
-
-    # တိုတိုလေးဖြင့် နှုတ်ဆက်ထားပါက (စာလုံးရေ ၁၅ လုံးအောက်)
-    return any(clean_q == g or (clean_q.startswith(g) and len(clean_q) <= 15) for g in greetings)
+    for greeting in _GREETINGS:
+        if clean_q == greeting:
+            return True
+        if clean_q.startswith(greeting) and not _strip_politeness(clean_q[len(greeting):]):
+            return True
+    return False
 
 
 def get_greeting_response() -> str:
@@ -74,16 +110,45 @@ def get_greeting_response() -> str:
 # 2. SYSTEM META & SOURCES REPORT
 # ============================================================
 
+# Unambiguous references to THIS system — safe to match on their own.
+_STRONG_META_MARKERS = (
+    "စနစ်အခြေအနေ", "bot အကြောင်း", "ဘာတွေထည့်ထား", "ဘယ်သတင်းတွေပါ",
+    "status", "source", "sources",
+)
+
+# Ordinary news vocabulary. "မီဒီယာ" (media) and "သတင်းဌာန" (news agency) turn up
+# in real news questions, so on their own they must NOT mean "tell me about the
+# system" — they only count when paired with a counting/enumeration form.
+_TOPIC_WORDS = ("သတင်းဌာန", "မီဒီယာ")
+
+_COUNTING_FORMS = ("ဘယ်နှ", "ဘယ်မီဒီယာ", "စာရင်း")
+
+
 def is_system_meta_query(query: str) -> bool:
-    """စနစ်အကြောင်း၊ သတင်းဌာန အရေအတွက်အကြောင်း မေးမြန်းခြင်း ဟုတ်/မဟုတ် စစ်ဆေးခြင်း"""
+    """စနစ်အကြောင်း၊ သတင်းဌာန အရေအတွက်အကြောင်း မေးမြန်းခြင်း ဟုတ်/မဟုတ် စစ်ဆေးခြင်း
+
+    This route runs before the article search, so a false positive here means
+    the user's question is replaced by the canned source list. Matching the bare
+    topical words used to do exactly that:
+
+        "မီဒီယာတွေအပေါ် ဖိအားပေးမှုသတင်း"  (news about pressure on the media)
+        "နိုင်ငံခြားသတင်းဌာနတွေ ဘာပြောလဲ"  (what do foreign news agencies say)
+
+    both returned the source list instead of searching. A topical word now needs
+    a counting/enumeration form beside it to count as a question about the
+    system.
+    """
     if not query:
         return False
-    markers = [
-        "သတင်းဌာန", "ဘယ်နှစ်ခု", "ဘယ်နှခု", "မီဒီယာ", "ဘယ်မီဒီယာ", "source", "sources",
-        "ဘာတွေထည့်ထား", "ဘယ်သတင်းတွေပါ", "စနစ်အခြေအနေ", "status", "bot အကြောင်း",
-    ]
     low = query.lower()
-    return any(m in low for m in markers)
+
+    if any(marker in low for marker in _STRONG_META_MARKERS):
+        return True
+
+    if any(topic in low for topic in _TOPIC_WORDS):
+        return any(form in low for form in _COUNTING_FORMS)
+
+    return False
 
 
 def get_sources_report() -> str:

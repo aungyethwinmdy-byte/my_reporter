@@ -1,4 +1,3 @@
-import contextlib
 import json
 import sqlite3
 import unittest
@@ -111,7 +110,12 @@ class DownloadDatabaseTests(unittest.TestCase):
             database_path = Path(directory) / "history.sqlite3"
             manifest_path = Path(directory) / "manifest.json"
             init_database(database_path)
-            with contextlib.closing(sqlite3.connect(database_path)) as connection:
+            # sqlite3.connect() must be closed explicitly: `contextlib.closing`
+            # only ends the transaction, the file handle outlives the `with`
+            # block and Windows then refuses to remove the temp directory
+            # (WinError 32) inside TemporaryDirectory.__exit__.
+            connection = sqlite3.connect(database_path)
+            try:
                 record_status(
                     connection,
                     newspaper="Myanma_Alinn",
@@ -136,6 +140,8 @@ class DownloadDatabaseTests(unittest.TestCase):
                     drive_url="https://drive.google.com/file/d/abc/view",
                 )
                 manifest = export_manifest(connection, manifest_path)
+            finally:
+                connection.close()
 
             self.assertEqual(len(manifest), 1)
             self.assertEqual(json.loads(manifest_path.read_text()), manifest)
@@ -145,7 +151,8 @@ class DownloadDatabaseTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "history.sqlite3"
             init_database(database_path)
-            with contextlib.closing(sqlite3.connect(database_path)) as connection:
+            connection = sqlite3.connect(database_path)
+            try:
                 for status in ("downloaded", "uploaded"):
                     record_status(
                         connection,
@@ -161,6 +168,8 @@ class DownloadDatabaseTests(unittest.TestCase):
                 row = connection.execute(
                     "SELECT status, drive_url FROM download_history WHERE source_file_id = 'km-1'"
                 ).fetchone()
+            finally:
+                connection.close()
             self.assertEqual(row[0], "uploaded")
             self.assertEqual(row[1], "https://drive.google.com/x")
 
@@ -168,7 +177,7 @@ class DownloadDatabaseTests(unittest.TestCase):
 class ModuleImportTests(unittest.TestCase):
     """Missing credentials / optional libs ကြောင့် import မပျက်စေရန် အာမခံချက်။"""
 
-    CORE = ("database", "notifications", "utils", "ingest_engine", "main")
+    CORE = ("database", "notifications", "utils", "number_utils", "ingest_engine", "main")
     BOT = (
         "telegram_bot",
         "cross_source_verifier",

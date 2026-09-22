@@ -1,0 +1,49 @@
+name: Check Drive Duplicates
+
+# Read-only diagnostic for the newspaper PDF folders.
+#
+# WHY THIS EXISTS
+# ---------------
+# main.py used to bind its SQLite history connection inside the
+# `if __name__ == "__main__":` block, which creates a __main__-local rather than
+# setting main.DB_CONNECTION. save_history() therefore silently discarded every
+# row, is_uploaded() always returned False, and the same newspaper issue was
+# downloaded and re-uploaded to Google Drive on every single run.
+#
+# This workflow runs scripts/check_drive_duplicates.py against the real folders
+# to show how far that went. It is strictly read-only: the script only ever
+# calls files().list() and never deletes, renames, or moves anything.
+#
+# The Drive credentials already exist as repository secrets (the daily pipeline
+# uses them), so this needs no local setup at all.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check-duplicates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Deliberately minimal: the script does not import main.py, so none of the
+      # scraping / ingest / Supabase / Gemini stack is needed here.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-api-python-client google-auth
+
+      - name: Check for duplicate newspaper PDFs
+        env:
+          MAL_FOLDER_ID: ${{ secrets.MAL_FOLDER_ID }}
+          KM_FOLDER_ID: ${{ secrets.KM_FOLDER_ID }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+        run: python scripts/check_drive_duplicates.py

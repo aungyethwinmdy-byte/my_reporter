@@ -1,10 +1,23 @@
 import logging
 import os
 import sqlite3
-import sys
 import argparse
 import tempfile
 from datetime import datetime, timedelta, timezone
+
+# Load .env before importing anything local. Several local modules read the
+# environment at import time and freeze the result (utils.VERIFY_TLS is the one
+# that bit us), so an entry point must establish the environment itself rather
+# than inherit whichever import line happened to pull in dotenv. The module
+# constants below (MAL_FOLDER_ID, TELEGRAM_*, NEWSPAPER) are read at import time
+# for the same reason.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    # Optional: on CI the values come from the environment directly.
+    pass
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -26,12 +39,9 @@ from notifications import (
     build_success_notification,
 )
 from utils import (
-    absolute_url,
     download_pdf_to_disk,
     find_moi_paper_universal,
     get_mdn_backup_papers,
-    is_valid_pdf,
-    MOI_SOURCES,
 )
 
 from ingest_engine import process_and_ingest_pdf
@@ -53,6 +63,32 @@ logger = logging.getLogger("my_reporter")
 
 MMT_TZ = timezone(timedelta(hours=6, minutes=30))
 DB_CONNECTION = None
+
+
+def set_database_connection(connection):
+    """Bind the module-level history connection.
+
+    ``__main__`` cannot assign this directly: a bare ``DB_CONNECTION = ...``
+    inside the ``if __name__ == "__main__":`` block creates a *new local* in
+    the ``__main__`` module, leaving ``main.DB_CONNECTION`` as ``None``. Every
+    ``save_history()`` call then hit its early ``if DB_CONNECTION is None:
+    return`` and silently discarded the row, so ``is_uploaded()`` never saw a
+    history entry and the pipeline re-downloaded and re-uploaded the same issue
+    on every run. Route the assignment through this function instead.
+    """
+    global DB_CONNECTION
+    DB_CONNECTION = connection
+    return DB_CONNECTION
+
+
+def close_database_connection():
+    """Commit and close the history connection if one is bound."""
+    global DB_CONNECTION
+    if DB_CONNECTION is not None:
+        try:
+            DB_CONNECTION.close()
+        finally:
+            DB_CONNECTION = None
 
 
 def resolve_download_date(value):
@@ -147,10 +183,60 @@ def get_gdrive_service():
         return None
 
 
-def file_exists_in_gdrive(service, folder_id, file_id_str):
-    if not service: return False
+def _drive_query_literal(value):
+    """Return *value* as a quoted Drive ``q`` literal, or ``None`` if unsafe.
+
+    Drive's query language has no parameter binding — values are interpolated
+    between single quotes, so an embedded quote would end the literal and
+    silently change the meaning of the query. Backslash is its escape
+    character, so it is rejected for the same reason. Names we build cannot
+    contain either; such a value is a programming error, and guessing at an
+    escape is how query injection starts.
+    """
+    if value is None:
+        return None
+    text = str(value)
+    if not text or "'" in text or "\\" in text:
+        return None
+    return f"'{text}'"
+
+
+def file_exists_in_gdrive(service, folder_id, name_fragment):
+    """True when the folder already holds a file whose name contains *name_fragment*.
+
+    *name_fragment* MUST be derived from the same string handed to
+    :func:`upload_to_gdrive` as the Drive file name — ``<dd-Mon-yyyy>_<prefix>``,
+    e.g. ``18-Sep-2026_myanmaalinn``.
+
+    The call site used to pass the *history* key instead
+    (``<prefix>_<dd>_<mm>_<yyyy>`` -> ``myanmaalinn_18_09_2026``). Those two
+    strings never overlap: the separators differ (``-`` vs ``_``) and the field
+    order is reversed, so ``name contains '<file_id>'`` could not match a single
+    file this pipeline had ever uploaded. The guard was dead code from the day it
+    was written — which is why the Drive folders accumulated duplicate copies of
+    the same issue. It matters more than it looks: the CI runner starts from a
+    fresh checkout and never restores ``download_history.sqlite3`` (it is
+    uploaded as a run artifact, never downloaded), so ``is_uploaded()`` is
+    always False there and this was the only duplicate guard left in a run.
+    """
+    if not service:
+        return False
+
+    folder_literal = _drive_query_literal(folder_id)
+    name_literal = _drive_query_literal(name_fragment)
+    if folder_literal is None or name_literal is None:
+        logger.error(
+            "Refusing Drive duplicate lookup with an unsafe query value: folder=%r name=%r",
+            folder_id,
+            name_fragment,
+        )
+        return False
+
     try:
-        query = f"'{folder_id}' in parents and name contains '{file_id_str}' and trashed = false"
+        query = (
+            f"{folder_literal} in parents and name contains {name_literal} "
+            "and trashed = false"
+        )
         results = service.files().list(q=query, fields="files(id, name)").execute()
         return len(results.get("files", [])) > 0
     except Exception as e:
@@ -175,6 +261,10 @@ def process_newspaper(service, folder_id, name, prefix, file_prefix, base_url, d
     year = str(download_date.year)
     published_date = download_date.isoformat()
     filename = f"{download_date.strftime('%d-%b-%Y')}_{file_prefix}.pdf"
+    # What the Drive file will actually be called, minus the extension. The
+    # duplicate lookup has to search for THIS, not the history key — see
+    # file_exists_in_gdrive() for why the two are not interchangeable.
+    drive_name_fragment = os.path.splitext(filename)[0]
 
     file_url = find_moi_paper_universal(prefix, base_url, day, month, year)
     source_name = "moi"
@@ -196,7 +286,7 @@ def process_newspaper(service, folder_id, name, prefix, file_prefix, base_url, d
         logger.info("Skipping database duplicate source=%s", file_prefix)
         return [], None
 
-    if service and file_exists_in_gdrive(service, folder_id, file_id):
+    if service and file_exists_in_gdrive(service, folder_id, drive_name_fragment):
         logger.info("Skipping Drive duplicate source=%s", file_prefix)
         save_history(
             newspaper=file_prefix, source=source_name, published_date=published_date,
@@ -226,7 +316,16 @@ def process_newspaper(service, folder_id, name, prefix, file_prefix, base_url, d
                     status="uploaded", drive_url=drive_link,
                 )
             except Exception as drive_err:
+                # Record the failure. Previously this branch only logged, so the
+                # row stayed absent from download_history: `is_uploaded` returned
+                # False forever, the Drive folder silently missed the issue, and
+                # the run still reported success to Telegram.
                 logger.error("Drive upload failed: %s", drive_err)
+                save_history(
+                    newspaper=file_prefix, source=source_name, published_date=published_date,
+                    source_file_id=file_id, source_url=file_url, filename=filename,
+                    status="failed", error=f"Drive upload failed: {drive_err}",
+                )
         else:
             save_history(
                 newspaper=file_prefix, source=source_name, published_date=published_date,
@@ -235,11 +334,24 @@ def process_newspaper(service, folder_id, name, prefix, file_prefix, base_url, d
             )
 
         # Direct DB Ingestion
-        ingest_ok = process_and_ingest_pdf(local_path, name, published_date)
+        # The PDF is already safely uploaded at this point, so an ingestion
+        # failure must not abort the run: without this guard an exception here
+        # propagated out of process_newspaper() and the *second* newspaper was
+        # never fetched at all.
+        try:
+            ingest_ok = process_and_ingest_pdf(local_path, name, published_date)
+        except Exception as ingest_err:
+            logger.exception("Supabase ingestion raised for %s", filename)
+            ingest_ok = False
+            ingest_error = ingest_err
+        else:
+            ingest_error = None
+
         if ingest_ok:
             logger.info("Supabase direct ingestion success for %s", filename)
         else:
-            logger.warning("Supabase direct ingestion skipped or failed for %s", filename)
+            detail = f": {ingest_error}" if ingest_error else ""
+            logger.warning("Supabase direct ingestion skipped or failed for %s%s", filename, detail)
 
         # NOTE: Telegram inline buttons require a real http(s) URL. Passing the
         # literal "Direct DB Ingested" made sendMessage fail with HTTP 400,
@@ -251,6 +363,31 @@ def process_newspaper(service, folder_id, name, prefix, file_prefix, base_url, d
             except Exception: pass
 
 
+def notify_run_result(date_label, uploads, failures, drive_urls):
+    """Send the run summary and return the message that was sent.
+
+    The dispatch order is the whole point of this function. `uploads` used to be
+    tested first, with the failure branch reachable only when nothing had
+    succeeded at all — so a run where မြန်မာ့အလင်း uploaded and ကြေးမုံ failed sent
+    "✅ လုပ်ငန်းစဉ် အောင်မြင်စွာ ပြီးဆုံးပါပြီ" and never named the missing paper.
+    A partial failure now travels with the success message instead.
+
+    Extracted from the ``__main__`` block so the choice of message is reachable
+    from tests: code under ``if __name__ == "__main__":`` cannot be exercised by
+    importing the module, which is why this ordering was never covered.
+    """
+    if uploads:
+        message, buttons = build_success_notification(
+            date_label, uploads, drive_urls, failures
+        )
+    elif failures:
+        message, buttons = build_error_notification(date_label, failures)
+    else:
+        message, buttons = build_idle_notification(date_label)
+    send_telegram_message(message, buttons)
+    return message
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", help="YYYY-MM-DD format")
@@ -260,7 +397,10 @@ if __name__ == "__main__":
     download_date = resolve_download_date(requested_date_str)
 
     init_database(DATABASE_PATH)
-    DB_CONNECTION = sqlite3.connect(DATABASE_PATH)
+    # Must go through the setter: a bare assignment here would create a
+    # __main__-local and leave main.DB_CONNECTION as None (see the docstring on
+    # set_database_connection for what that silently broke).
+    set_database_connection(sqlite3.connect(DATABASE_PATH))
     logger.info(
         "Starting download date=%s selection=%s database=%s",
         download_date.isoformat(), NEWSPAPER_SELECTION, DATABASE_PATH,
@@ -282,7 +422,7 @@ if __name__ == "__main__":
 
     all_uploads = mal_uploads + km_uploads
     export_manifest(DB_CONNECTION, MANIFEST_PATH)
-    DB_CONNECTION.close()
+    close_database_connection()
     today_date = download_date.strftime("%d-%b-%Y")
     logger.info("Completed uploads=%d manifest=%s", len(all_uploads), MANIFEST_PATH)
 
@@ -290,16 +430,11 @@ if __name__ == "__main__":
         "မြန်မာ့အလင်း": f"https://drive.google.com/drive/folders/{MAL_FOLDER_ID}",
         "ကြေးမုံ": f"https://drive.google.com/drive/folders/{KM_FOLDER_ID}",
     }
-    if all_uploads:
-        msg, buttons = build_success_notification(today_date, all_uploads, drive_urls)
-        send_telegram_message(msg, buttons)
-    elif err_mal or err_km:
-        errors = []
-        if err_mal: errors.append(("မြန်မာ့အလင်း", err_mal))
-        if err_km: errors.append(("ကြေးမုံ", err_km))
-        msg, buttons = build_error_notification(today_date, errors)
-        send_telegram_message(msg, buttons)
-    else:
-        msg, buttons = build_idle_notification(today_date)
-        send_telegram_message(msg, buttons)
+    failures = []
+    if err_mal:
+        failures.append(("မြန်မာ့အလင်း", err_mal))
+    if err_km:
+        failures.append(("ကြေးမုံ", err_km))
+
+    notify_run_result(today_date, all_uploads, failures, drive_urls)
     logger.info("Process completed")

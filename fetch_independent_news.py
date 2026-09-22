@@ -8,7 +8,14 @@ Strategy:
 - The Irrawaddy   : Official Telegram Mirror (Bypasses Cloudflare 403)
 - RFA Burmese     : Official Telegram Mirror (Bypasses Cloudflare/Timeout)
 Deduplication:
-- SHA-256 Hash + Supabase URL Upsert (on_conflict='url')
+- Supabase URL Upsert (on_conflict='url') — the URL column is the ONLY dedup
+  key. `content_hash` is stored for reference but is NOT a conflict target, so
+  the same article republished under a different URL is stored twice.
+- Note the t.me fallback below: when a Telegram post carries no outbound
+  article link, the *message* URL is stored instead. Those message URLs are
+  unique per post, so a repost of identical content produces a second row with
+  an identical content_hash. Making content_hash the conflict target would
+  close that gap, but it requires a matching UNIQUE constraint in the table.
 ================================================================
 """
 
@@ -26,6 +33,7 @@ import requests
 import feedparser
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from env_config import get_supabase_credentials
 from supabase import create_client, Client
 
 env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -38,12 +46,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("NewsIngestor")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = (
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    or os.getenv("SUPABASE_KEY")
-    or os.getenv("SUPABASE_ANON_KEY")
-)
+SUPABASE_URL, SUPABASE_KEY = get_supabase_credentials()
 INDEPENDENT_TABLE_NAME = os.getenv("INDEPENDENT_TABLE_NAME", "independent_articles")
 
 # NOTE: the client is created lazily (see get_supabase_client) so that importing
@@ -118,11 +121,22 @@ def calculate_hash(text: str) -> str:
 
 
 def parse_published_date(entry: dict) -> str:
-    """RSS published date မှ YYYY-MM-DD ပြောင်းလဲခြင်း"""
+    """RSS published date မှ YYYY-MM-DD (မြန်မာစံတော်ချိန်) ပြောင်းလဲခြင်း
+
+    ``parsedate_to_datetime`` keeps the feed's own offset, which is almost always
+    GMT, and formatting that directly stores the *UTC* date. Myanmar is UTC+6:30,
+    so anything published after 17:30 UTC is already the next day locally — a
+    quarter of the clock landed on the wrong date. Those articles were then
+    excluded from a today-scoped ``/compare`` or daily briefing, and the RSS path
+    disagreed with the Telegram path, which already converted (see below).
+    """
     if "published" in entry:
         try:
             dt = parsedate_to_datetime(entry["published"])
-            return dt.strftime("%Y-%m-%d")
+            if dt.tzinfo is None:
+                # A feed that omits the zone; RFC 822 treats that as GMT.
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(MYANMAR_TZ).strftime("%Y-%m-%d")
         except Exception:
             pass
     return datetime.now(MYANMAR_TZ).strftime("%Y-%m-%d")
@@ -193,12 +207,14 @@ def fetch_from_rss(source_name: str, feed_url: str) -> List[Dict]:
 def fetch_from_telegram(source_name: str, mirror_urls: List[str]) -> List[Dict]:
     logger.info("Collecting source: %s (Telegram Mirror Channel)", source_name)
     resp = None
+    used_url = None
 
     for target_url in mirror_urls:
         try:
             r = requests.get(target_url, headers=HEADERS, proxies=PROXIES, timeout=15)
             if r.status_code == 200:
                 resp = r
+                used_url = target_url
                 break
         except Exception:
             continue
@@ -211,6 +227,33 @@ def fetch_from_telegram(source_name: str, mirror_urls: List[str]) -> List[Dict]:
     try:
         soup = BeautifulSoup(resp.text, "html.parser")
         messages = soup.find_all("div", class_="tgme_widget_message")
+
+        if not messages:
+            # A t.me/s/<name> link can resolve to a user *contact* page instead of
+            # a channel preview. Those return HTTP 200 with the title
+            # "Telegram: Contact @<name>", ~9 KB of body and zero message blocks,
+            # so they look like a successful fetch that simply had nothing new.
+            # RFA Burmese was configured exactly this way (t.me/s/RFA_Burmese and
+            # t.me/s/rfaburmese are both user accounts) and silently contributed
+            # zero articles for the whole time it was listed as a monitored
+            # source. Say so explicitly rather than returning a bare [].
+            title_tag = soup.find("title")
+            title = title_tag.get_text(strip=True) if title_tag else ""
+            if "contact" in title.lower():
+                logger.error(
+                    "❌ %s: %s is a user contact page, not a channel — no web "
+                    "preview to scrape. Point this at a public channel with a "
+                    "/s/ preview URL.",
+                    source_name, used_url,
+                )
+            else:
+                logger.warning(
+                    "⚠️ %s: %s returned no message blocks (channel empty, or the "
+                    "preview markup changed).",
+                    source_name, used_url,
+                )
+            return []
+
         domain_pattern = re.compile(r"(irrawaddy\.com|rfa\.org)", re.IGNORECASE)
 
         # နောက်ဆုံးတင်ထားသော သတင်း ၁၅ ပုဒ်ကို ယူခြင်း
@@ -228,6 +271,11 @@ def fetch_from_telegram(source_name: str, mirror_urls: List[str]) -> List[Dict]:
             article_url = link_tag.get("href") if link_tag else None
 
             if not article_url:
+                # Fallback: store the Telegram message URL itself. This keeps the
+                # content (useful for /compare) but means the `url` column is not
+                # always an article link — in production ~55% of rows are t.me
+                # links. Because url is the only dedup key, a repost of the same
+                # content under a new message URL inserts a second row.
                 msg_link_tag = msg.find("a", class_="tgme_widget_message_date")
                 article_url = msg_link_tag.get("href") if msg_link_tag else None
 
@@ -289,9 +337,18 @@ def save_articles_to_supabase(articles: List[Dict]) -> int:
             ignore_duplicates=True
         ).execute()
 
-        synced_count = len(response.data) if response.data else len(articles)
-        logger.info("✅ Supabase Batch Synced: %s articles processed.", synced_count)
-        return synced_count
+        # With ignore_duplicates=True PostgREST returns only the rows that were
+        # actually inserted, so an empty response means "every candidate was
+        # already present" — a perfectly normal, healthy run. The old
+        # `len(response.data) if response.data else len(articles)` treated that
+        # empty list as a failure to read and fell back to the candidate count,
+        # so a run that inserted nothing reported "N articles processed".
+        inserted = len(response.data) if response.data else 0
+        logger.info(
+            "✅ Supabase Batch Synced: %s new, %s already present (candidates: %s).",
+            inserted, len(articles) - inserted, len(articles),
+        )
+        return inserted
     except Exception as e:
         logger.error("❌ Supabase sync failed: %s", e)
         return 0
@@ -304,16 +361,38 @@ def fetch_all() -> int:
     logger.info("=" * 60)
 
     all_articles = []
+    per_source: Dict[str, int] = {}
 
     # ၁။ BBC Burmese (Direct RSS)
     for source_name, feed_url in RSS_FEEDS.items():
-        all_articles.extend(fetch_from_rss(source_name, feed_url))
+        got = fetch_from_rss(source_name, feed_url)
+        per_source[source_name] = len(got)
+        all_articles.extend(got)
 
     # ၂။ The Irrawaddy & RFA Burmese (Telegram Channel Mirror)
     for source_name, mirror_urls in TELEGRAM_SOURCES.items():
-        all_articles.extend(fetch_from_telegram(source_name, mirror_urls))
+        got = fetch_from_telegram(source_name, mirror_urls)
+        per_source[source_name] = len(got)
+        all_articles.extend(got)
 
     logger.info("📊 Total candidate articles collected: %s", len(all_articles))
+    for name, n in per_source.items():
+        logger.info("   • %-16s %s", name, n)
+
+    # A source that yields nothing is a silent data gap: it still appears in
+    # /sources as "monitored" and in MONITORED_SOURCES, so the bot claims
+    # coverage it does not have. RFA Burmese sat at 0 for exactly this reason —
+    # its configured t.me URLs resolve to a *contact* page ("Telegram: Contact
+    # @RFA_Burmese"), not a channel preview, so there are no message blocks to
+    # parse. Surface it loudly instead of letting the run look healthy.
+    dead = [name for name, n in per_source.items() if n == 0]
+    if dead:
+        logger.warning(
+            "⚠️ Source(s) returned ZERO articles: %s — check the configured feed/"
+            "mirror URLs; a t.me link that resolves to a 'Contact @name' page is "
+            "a user account, not a channel, and will never yield messages.",
+            ", ".join(dead),
+        )
 
     synced_count = save_articles_to_supabase(all_articles)
 

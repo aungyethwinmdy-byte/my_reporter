@@ -17,7 +17,7 @@ def _button_rows(uploads, drive_urls):
     return {"inline_keyboard": rows} if rows else None
 
 
-def build_success_notification(date_label, uploads, drive_urls):
+def build_success_notification(date_label, uploads, drive_urls, errors=None):
     lines = [
         "<b>✅ လုပ်ငန်းစဉ် အောင်မြင်စွာ ပြီးဆုံးပါပြီ</b>",
         f"<i>📅 ရက်စွဲ — {html.escape(date_label)}</i>",
@@ -32,6 +32,17 @@ def build_success_notification(date_label, uploads, drive_urls):
             "<b>အောက်ပါခလုတ်များမှ ဖိုင် သို့မဟုတ် Google Drive ဖိုဒါကို ဖွင့်နိုင်ပါသည်။</b>",
         ]
     )
+    # A run can succeed for one newspaper and fail for the other. The caller
+    # used to reach the error notification only when NOTHING had succeeded, so a
+    # partial failure was reported as a clean success and the missing paper was
+    # never named — the operator had to read the logs to find out. Carry the
+    # failures into this message instead.
+    if errors:
+        lines.extend(["", "<b>⚠️ မပြည့်စုံသော အချက်များ</b>"])
+        for label, error in errors:
+            lines.append(
+                f"• <b>{html.escape(str(label))}</b> — {html.escape(str(error))}"
+            )
     return "\n".join(lines), _button_rows(uploads, drive_urls)
 
 
