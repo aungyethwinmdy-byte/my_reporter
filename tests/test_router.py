@@ -23,6 +23,7 @@ from system_router import (
     is_system_meta_query,
 )
 from telegram_bot import execute_articles_search
+from telegram.error import BadRequest
 
 
 class RouterClassificationTests(unittest.TestCase):
@@ -977,6 +978,95 @@ class Page2PriceTableTests(unittest.TestCase):
         self.assertNotIn("ရည်ညွှန်း", mangled)
         self.assertNotIn("စက်သုံးဆီ", mangled)
         self.assertEqual(self._run([[["x"], [mangled]]]), [])
+
+
+class DeliveryFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """A failed placeholder must not silently swallow the answer.
+
+    Every route ended with `safe_send_or_edit(status_msg, chunks[0], is_edit=True)`
+    and not one of them passed an `update_context`. When the placeholder failed to
+    send, `status_msg` was None, so `is_edit and message_obj` was falsy, the
+    `elif update_context ...` could not fire either, and the function returned
+    None: **the first chunk of the answer was dropped** and the user received only
+    chunks 2..n. That contradicts the helper's whole purpose — it exists to be the
+    robust delivery path.
+    """
+
+    ANSWER = "ပထမပိုင်း" + ("က" * 2000) + "\n\n" + "ဒုတိယပိုင်း" + ("ခ" * 2000)
+
+    def _update(self, reply_text):
+        return SimpleNamespace(
+            message=SimpleNamespace(
+                reply_text=reply_text, text="ဒီနေ့ သတင်းအခြေအနေ"
+            )
+        )
+
+    async def _drive(self, reply_text):
+        import telegram_bot as tb
+
+        with patch.object(tb, "is_greeting_or_casual", return_value=False), patch.object(
+            tb, "is_system_meta_query", return_value=False
+        ), patch.object(
+            tb, "get_myanmar_dates", return_value=("2026-09-22", "2026-09-21")
+        ), patch.object(
+            tb, "is_numeric_or_price_query", return_value=False
+        ), patch.object(
+            tb, "is_general_daily_news_query", return_value=False
+        ), patch.object(
+            tb, "get_supabase_client", return_value=object()
+        ), patch.object(
+            tb, "get_genai_client", return_value=object()
+        ), patch.object(
+            tb, "execute_articles_search", return_value=[{"headline": "ခေါင်းစဉ်"}]
+        ), patch.object(
+            tb, "generate_general_editorial_response", return_value=self.ANSWER
+        ):
+            await tb.message_handler(self._update(reply_text), SimpleNamespace())
+
+    async def test_the_first_chunk_still_arrives_when_the_placeholder_fails(self):
+        delivered = []
+        attempts = {"n": 0}
+
+        async def reply_text(text, **kwargs):
+            attempts["n"] += 1
+            # The placeholder burns two attempts: Markdown, then plain fallback.
+            if attempts["n"] <= 2:
+                raise BadRequest("placeholder rejected")
+            delivered.append(text)
+            return SimpleNamespace()
+
+        await self._drive(reply_text)
+
+        self.assertTrue(delivered, "the answer was never delivered at all")
+        self.assertTrue(
+            any(chunk.startswith("ပထမပိုင်း") for chunk in delivered),
+            "the first chunk was dropped; delivered="
+            f"{[c[:12] for c in delivered]}",
+        )
+
+    async def test_edit_falls_back_to_a_new_message_when_the_target_is_gone(self):
+        import telegram_bot as tb
+
+        sent = []
+
+        async def reply_text(text, **kwargs):
+            sent.append(text)
+            return SimpleNamespace()
+
+        result = await tb.safe_send_or_edit(
+            None, "မက်ဆေ့ခ်ျ", is_edit=True, update_context=self._update(reply_text)
+        )
+
+        self.assertEqual(sent, ["မက်ဆေ့ခ်ျ"])
+        self.assertIsNotNone(result, "a fallback send must report success")
+
+    async def test_no_target_and_no_context_still_returns_none(self):
+        """The genuinely hopeless case must not raise."""
+        import telegram_bot as tb
+
+        self.assertIsNone(
+            await tb.safe_send_or_edit(None, "text", is_edit=True, update_context=None)
+        )
 
 
 if __name__ == "__main__":

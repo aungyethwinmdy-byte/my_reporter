@@ -160,7 +160,14 @@ async def safe_send_or_edit(
     is_edit: bool = False,
     update_context=None,
 ):
-    """Send or edit telegram messages with retry and plain text fallback."""
+    """Send or edit telegram messages with retry and plain text fallback.
+
+    IMPORTANT for callers: pass `update_context` whenever you pass `is_edit`.
+    If the placeholder message failed to send, `message_obj` is None and the
+    edit branch is skipped; without `update_context` there is nothing left to
+    send to and the text is dropped silently. Every route used to omit it, so a
+    failed placeholder cost the user the first chunk of the answer.
+    """
     clean_text = re.sub(r"[*_`\[\]]", "", text)[:4000]
     for attempt in range(2):
         try:
@@ -597,12 +604,17 @@ async def compare_command_handler(update: Update, context: ContextTypes.DEFAULT_
         report = await asyncio.to_thread(run_cross_source_comparison, topic)
         text = report.get("report") or report.get("editorial") or "စိစစ်ချက် မတွေ့ရှိပါ။"
         chunks = split_message_text(text)
-        await safe_send_or_edit(status_msg, chunks[0], is_edit=True)
+        await safe_send_or_edit(
+            status_msg, chunks[0], is_edit=True, update_context=update
+        )
         for ch in chunks[1:]:
             await safe_send_or_edit(None, ch, is_edit=False, update_context=update)
     except Exception as e:
         logger.error("Compare error: %s", e)
-        await safe_send_or_edit(status_msg, f"⚠️ အမှားဖြစ်ပေါ်ခဲ့သည်: `{e}`", is_edit=True)
+        await safe_send_or_edit(
+            status_msg, f"⚠️ အမှားဖြစ်ပေါ်ခဲ့သည်: `{e}`", is_edit=True,
+            update_context=update,
+        )
 
 
 # ============================================================
@@ -682,7 +694,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     title_override=f"{comm_key} ဈေးနှုန်းများ" if comm_key else "",
                 )
                 chunks = split_message_text(report)
-                await safe_send_or_edit(status_msg, chunks[0], is_edit=True)
+                await safe_send_or_edit(
+                    status_msg, chunks[0], is_edit=True, update_context=update
+                )
                 for ch in chunks[1:]:
                     await safe_send_or_edit(None, ch, is_edit=False, update_context=update)
                 return
@@ -705,7 +719,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 generate_general_editorial_response, genai_client, user_query, articles, target_dates
             )
             chunks = split_message_text(final_answer)
-            await safe_send_or_edit(status_msg, chunks[0], is_edit=True)
+            await safe_send_or_edit(
+                status_msg, chunks[0], is_edit=True, update_context=update
+            )
             for ch in chunks[1:]:
                 await safe_send_or_edit(None, ch, is_edit=False, update_context=update)
             return
@@ -716,11 +732,18 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         general_answer = await asyncio.to_thread(
             handle_general_ai_conversation, user_query, genai_client, GEMINI_MODEL
         )
-        await safe_send_or_edit(status_msg, general_answer, is_edit=True)
+        await safe_send_or_edit(
+            status_msg, general_answer, is_edit=True, update_context=update
+        )
 
     except Exception as e:
         logger.error("❌ Execution error: %s", e, exc_info=True)
-        await safe_send_or_edit(status_msg, f"⚠️ အချက်အလက်ထုတ်ယူရာတွင် ချို့ယွင်းချက်ဖြစ်ပေါ်ခဲ့သည်: `{e}`", is_edit=True)
+        await safe_send_or_edit(
+            status_msg,
+            f"⚠️ အချက်အလက်ထုတ်ယူရာတွင် ချို့ယွင်းချက်ဖြစ်ပေါ်ခဲ့သည်: `{e}`",
+            is_edit=True,
+            update_context=update,
+        )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
