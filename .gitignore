@@ -4,6 +4,11 @@ __pycache__/
 *$py.class
 .pytest_cache/
 
+# Coverage artifacts (coverage.py — used to find untested modules)
+.coverage
+.coverage.*
+htmlcov/
+
 # Environment Variables & Secrets (လုံခြုံရေးအတွက် မဖြစ်မနေ လိုအပ်သည်)
 .env
 *.env

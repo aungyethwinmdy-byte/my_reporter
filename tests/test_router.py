@@ -887,5 +887,97 @@ class GlyphPageTextGuardTests(unittest.TestCase):
             self.assertFalse(ie.is_usable_page_text(GlyphEncodedTextLayerTests.FITZ))
 
 
+class Page2PriceTableTests(unittest.TestCase):
+    """`extract_page2_tables` had ZERO coverage — which is how a dead branch lived.
+
+    Two defects were found by exercising it for the first time:
+
+    1. The fuel and gold checks were `if` / `elif`. The real page-2 box holds
+       both (its own headline reads "…ဓာတ်သတ္တု(ရွှေ)၊ စက်သုံးဆီ နှင့်
+       နိုင်ငံခြားငွေလဲ…"), so the fuel branch always won and the gold row was
+       never emitted. Live evidence: `newspaper_numbers` contains **0** rows with
+       `section='ရွှေ'`, though the branch has existed all along.
+    2. It returned `[]` completely silently, so a paper whose page-2 fonts have no
+       Unicode mapping looked exactly like a paper with no price box.
+    """
+
+    FUEL_ONLY = "ရန်ကုန်မြို့နှင့် မန္တလေးမြို့တို့အတွက် ရည်ညွှန်းလက်ကားဈေးနှုန်းများ\nOctane 92 | 3050"
+    GOLD_ONLY = "ဓာတ်သတ္တု(ရွှေ)ရည်ညွှန်းဈေးသတ်မှတ်ရေးကော်မတီ ရည်ညွှန်းဈေး\n၇၁၅၀၀၀၀"
+    # One box carrying both, exactly like the real paper.
+    COMBINED = (
+        "ရက်နေ့ရှိ ဓာတ်သတ္တု(ရွှေ)၊ စက်သုံးဆီ နှင့် နိုင်ငံခြားငွေလဲလှယ်နှုန်းများ\n"
+        "ရွှေတစ်ကျပ်သား ရည်ညွှန်းဈေး ၇၁၅၀၀၀၀ ကျပ်\nOctane 92 ရန်ကုန် ၃၀၅၀ ကျပ်"
+    )
+
+    def _run(self, tables, page_count=2):
+        page2 = SimpleNamespace(extract_tables=lambda: tables)
+        pages = [SimpleNamespace(extract_tables=lambda: []) for _ in range(page_count)]
+        if page_count >= 2:
+            pages[1] = page2
+        fake_pdf = MagicMock()
+        fake_pdf.pages = pages
+        opener = MagicMock()
+        opener.__enter__ = MagicMock(return_value=fake_pdf)
+        opener.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(ie, "pdfplumber") as plumber, patch.object(
+            ie.os.path, "exists", return_value=True
+        ):
+            plumber.open.return_value = opener
+            return ie.extract_page2_tables("x.pdf")
+
+    def test_a_combined_box_emits_both_the_fuel_and_gold_rows(self):
+        """The regression test for the `if`/`elif` bug."""
+        rows = self._run([[["x"], [self.COMBINED]]])
+
+        self.assertEqual([r["section"] for r in rows], ["စက်သုံးဆီ", "ရွှေ"])
+
+    def test_a_fuel_only_box_emits_one_row(self):
+        rows = self._run([[["x"], [self.FUEL_ONLY]]])
+
+        self.assertEqual([r["section"] for r in rows], ["စက်သုံးဆီ"])
+
+    def test_a_gold_only_box_emits_one_row(self):
+        rows = self._run([[["x"], [self.GOLD_ONLY]]])
+
+        self.assertEqual([r["section"] for r in rows], ["ရွှေ"])
+
+    def test_an_unmatched_page_is_reported_instead_of_failing_silently(self):
+        with self.assertLogs("IngestionPipeline", level="WARNING") as caught:
+            rows = self._run([[["x"], ["ကြော်ငြာ"]]])
+
+        self.assertEqual(rows, [])
+        self.assertTrue(
+            any("yielded no fuel/gold table" in line for line in caught.output),
+            "a missing price table must be visible in the logs",
+        )
+
+    def test_single_page_pdf_returns_empty(self):
+        self.assertEqual(self._run([[["x"]]], page_count=1), [])
+
+    def test_missing_pdfplumber_returns_empty(self):
+        with patch.object(ie, "pdfplumber", None):
+            self.assertEqual(ie.extract_page2_tables("x.pdf"), [])
+
+    def test_the_real_mangled_keywords_do_not_match(self):
+        """Pins a KNOWN limitation, using text captured from the live PDF.
+
+        ကြေးမုံ's page-2 gold box *is* detected as a table, but its text layer
+        mangles precisely the characters the check looks for: "ရွှေ" comes out as
+        "ေရ(cid:619)" and "ရည်ညွှန်း" as "ရည်\\ue101(cid:623) န်း". No string match
+        can succeed, which is why this function returns [] for BOTH newspapers
+        today. If a future fix makes these match, this test should be updated
+        rather than deleted.
+        """
+        mangled = (
+            "\n၁၂ - ၉ -၂၀၂၆ ရက်ေန(cid:485) ဓာတ်သတ\ue01f \ue2f1(ေရ(cid:619) )"
+            "ရည်\ue101(cid:623) န်းေ ဈး\nသိပ်သည်းဆ ၁၉.၂၅ ဂရမ်/ ကုဗစင်တီမီတာ"
+        )
+        self.assertNotIn("ရွှေ", mangled)
+        self.assertNotIn("ရည်ညွှန်း", mangled)
+        self.assertNotIn("စက်သုံးဆီ", mangled)
+        self.assertEqual(self._run([[["x"], [mangled]]]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

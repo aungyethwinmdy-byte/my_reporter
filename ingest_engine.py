@@ -182,6 +182,12 @@ def extract_page2_tables(pdf_path: str) -> list[dict]:
             for t in tables:
                 rows = [" | ".join([str(c).strip() for c in r if c]) for r in t if r]
                 full = "\n".join(rows)
+                # Two independent checks, NOT if/elif. The real page-2 box holds
+                # the gold rate and the fuel prices in the *same* table (its own
+                # headline is "…ဓာတ်သတ္တု(ရွှေ)၊ စက်သုံးဆီ နှင့် နိုင်ငံခြားငွေလဲ…"),
+                # so an `elif` meant the fuel branch always won and the gold row
+                # was never emitted. Live evidence: `newspaper_numbers` has 0 rows
+                # with section='ရွှေ' while the branch has existed all along.
                 if any(k in full for k in ["စက်သုံးဆီ", "ရည်ညွှန်းလက်ကား", "Octane", "Diesel", "ဒီဇယ်"]):
                     results.append({
                         "headline": "ရန်ကုန်မြို့နှင့် မန္တလေးမြို့တို့အတွက် ရည်ညွှန်းလက်ကားဈေးနှုန်းများ",
@@ -189,13 +195,27 @@ def extract_page2_tables(pdf_path: str) -> list[dict]:
                         "page_no": 2,
                         "section": "စက်သုံးဆီ",
                     })
-                elif "ရွှေ" in full and "ရည်ညွှန်း" in full:
+                if "ရွှေ" in full and "ရည်ညွှန်း" in full:
                     results.append({
                         "headline": "ဓာတ်သတ္တု(ရွှေ)ရည်ညွှန်းဈေးသတ်မှတ်ရေးကော်မတီ ရည်ညွှန်းဈေး",
                         "body_text": full,
                         "page_no": 2,
                         "section": "ရွှေ",
                     })
+            if not results:
+                # This used to fail completely silently. It is worth shouting
+                # about, because a paper whose page-2 fonts have no Unicode
+                # mapping produces mangled keywords that no string match can
+                # find — measured on the live 13 Sep 2026 ကြေးမုံ: the gold box
+                # reads "ေရ(cid:619)" for "ရွှေ" and "ရည်\ue101(cid:623) န်း" for
+                # "ရည်ညွှန်း", and the fuel box is not detected as a table at
+                # all, so this function returns [] for *both* newspapers.
+                logger.warning(
+                    "⚠️ Page 2 of %s yielded no fuel/gold table (%d table(s) "
+                    "found). The price rows will be missing; the page must be "
+                    "read by the vision pass instead.",
+                    os.path.basename(str(pdf_path)), len(tables),
+                )
     except Exception as e:
         logger.warning("Page 2 table extraction warning: %s", e)
     return results
