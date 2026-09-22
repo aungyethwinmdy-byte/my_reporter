@@ -37,6 +37,10 @@ from google.genai import types
 
 import gemini_config
 from gemini_config import generate_content_with_fallback
+# The write side of `newspaper_numbers.value`. Imported rather than re-derived so
+# the bot's auto-cache path and the ingestion path cannot store different values
+# for the same number (see tests/test_auto_numeric_extractor.py).
+from auto_numeric_extractor import clean_number
 
 from telegram import Update
 from telegram.request import HTTPXRequest
@@ -344,7 +348,17 @@ If no clear prices/numbers are found, return [].
     try:
         def _parse_json(text):
             cleaned = re.sub(r"^```json\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
-            return json.loads(cleaned)
+            data = json.loads(cleaned)
+            # Raise rather than return a wrong shape: the model fallback chain
+            # only advances when `parse` raises, so returning a dict made the
+            # chain treat a malformed answer as success and stop at the first
+            # model. The figures were then discarded with no retry.
+            if not isinstance(data, list):
+                raise ValueError("Numeric extraction did not return a JSON array")
+            rows = [item for item in data if isinstance(item, dict)]
+            if data and not rows:
+                raise ValueError("Numeric extraction returned no JSON objects")
+            return rows
 
         items = generate_content_with_fallback(
             client,
@@ -356,14 +370,30 @@ If no clear prices/numbers are found, return [].
             parse=_parse_json,
         )
         if isinstance(items, list) and items:
+            rows = []
             for it in items:
-                it["value"] = str(clean_number_value(it.get("value")) or it.get("value"))
+                # `clean_number` keeps the digit string ("3050"), where
+                # str(float(...)) produced "3050.0" and the dashboard rendered
+                # the spurious ".၀" — and it returns "" instead of echoing a
+                # non-numeric value into a column the reader parses as a number.
+                val = clean_number(str(it.get("value", "")))
+                if not val:
+                    # ဂဏန်းမထွက်ပါက newspaper_numbers.value ထဲ စာသား မထည့်ပါ။
+                    # (auto_numeric_extractor နှင့် တူညီသော မူဝါဒ)
+                    continue
+                it["value"] = val
+                rows.append(it)
+
+            if not rows:
+                logger.warning("Auto extraction produced no numeric values; nothing cached.")
+                return []
+
             try:
-                supabase_client.from_("newspaper_numbers").insert(items).execute()
-                logger.info("💾 Auto-cached %d new numeric items into DB.", len(items))
+                supabase_client.from_("newspaper_numbers").insert(rows).execute()
+                logger.info("💾 Auto-cached %d new numeric items into DB.", len(rows))
             except Exception as e:
                 logger.warning("Auto-cache insert failed: %s", e)
-            return items
+            return rows
     except Exception as e:
         logger.error("Auto extraction error: %s", e)
 
